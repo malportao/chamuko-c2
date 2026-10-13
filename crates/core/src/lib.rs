@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-use chamuko_plugin_api::{LifecycleEvent, Plugin, PluginError, PluginMetadata};
+use chamuko_plugin_api::{CommandOutput, LifecycleEvent, Plugin, PluginError, PluginMetadata};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RegistrationError {
@@ -102,6 +102,32 @@ impl PluginRegistry {
                     })
             })
             .collect()
+    }
+
+    /// Route a command to the first plugin that supports it and return its
+    /// output. Returns `None` if no plugin handles the command.
+    pub fn execute(
+        &mut self,
+        command: &str,
+        args: &[String],
+    ) -> Option<Result<CommandOutput, PluginError>> {
+        for entry in self.plugins.iter_mut() {
+            if entry.plugin.supports(command) {
+                return Some(entry.plugin.execute(command, args));
+            }
+        }
+        None
+    }
+
+    /// Returns the list of commands supported by the registered plugins.
+    pub fn supported_commands(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for entry in &self.plugins {
+            for cmd in entry.plugin.supported_commands() {
+                out.push(cmd);
+            }
+        }
+        out
     }
 }
 
