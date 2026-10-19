@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/plugin-api", "crates/core", "crates/agent"]
+members = [
+    "crates/plugin-api",
+    "crates/core",
+    "crates/protocol",
+    "crates/agent",
+]
 resolver = "3"
 
 [workspace.package]
@@ -11,6 +16,7 @@ publish = false
 [workspace.dependencies]
 chamuko-plugin-api = { path = "crates/plugin-api" }
 chamuko-core = { path = "crates/core" }
+chamuko-protocol = { path = "crates/protocol" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
