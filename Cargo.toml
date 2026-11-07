@@ -5,6 +5,7 @@ members = [
     "crates/protocol",
     "crates/agent",
     "crates/c2",
+    "crates/builder",
 ]
 resolver = "3"
 
@@ -21,3 +22,10 @@ chamuko-protocol = { path = "crates/protocol" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

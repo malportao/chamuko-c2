@@ -1,0 +1,12 @@
+[package]
+name = "chamuko-builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Chamuko agent builder with embedded C2 configuration"
+
+[dependencies]
+
+[lints]
+workspace = true
