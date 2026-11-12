@@ -1,5 +1,3 @@
-//! Red/black Havoc-style terminal UI for the Chamuko C2.
-
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -178,8 +176,6 @@ impl App {
     }
 
     fn local_log(&mut self, text: impl Into<String>) {
-        // Add to the selected agent's console so the operator sees feedback
-        // next to agent output. Falls back to a no-op if nothing selected.
         if let Some(id) = self.selected_agent() {
             let mut s = self.state.lock().unwrap();
             if let Some(entry) = s.get_mut(&id) {
@@ -296,11 +292,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 fn ui(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
-    // Title bar
     let title_style = Style::default().fg(RED).bg(BLACK).add_modifier(Modifier::BOLD);
     let title = Paragraph::new(Line::from(vec![
         Span::styled("  CHAMUKO C2 ", title_style),
-        Span::styled("| red team framework", Style::default().fg(GREY).bg(BLACK)),
+        Span::styled(
+            "| red team framework",
+            Style::default().fg(GREY).bg(BLACK),
+        ),
     ]))
     .block(Block::default().style(Style::default().bg(BLACK)));
 
@@ -311,7 +309,6 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     f.render_widget(title, chunks[0]);
 
-    // Body: agent list | console
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(28), Constraint::Percentage(72)])
@@ -320,7 +317,6 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_agents(f, app, body[0]);
     render_console(f, app, body[1]);
 
-    // Input bar
     let input = Paragraph::new(app.input.as_str())
         .style(Style::default().fg(BRIGHT).bg(BLACK))
         .block(
@@ -335,7 +331,6 @@ fn ui(f: &mut Frame, app: &mut App) {
         );
     f.render_widget(input, chunks[2]);
 
-    // Cursor position in the input bar
     let input_area = inner_input_rect(chunks[2]);
     f.set_cursor_position(ratatui::prelude::Position {
         x: input_area.x + app.input.len() as u16,
@@ -344,7 +339,6 @@ fn ui(f: &mut Frame, app: &mut App) {
 }
 
 fn inner_input_rect(outer: Rect) -> Rect {
-    // Account for the block borders (1 on each side) + 1 padding for the '>'
     let x = outer.x + 2;
     let y = outer.y + 1;
     let width = outer.width.saturating_sub(4);
@@ -366,8 +360,14 @@ fn render_agents(f: &mut Frame, app: &mut App, area: Rect) {
             let e = s.get(id)?;
             let age = chamuko_protocol::now_secs().saturating_sub(e.last_seen);
             let line = Line::from(vec![
-                Span::styled(format!("{id}  "), Style::default().fg(RED).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("{}@{}", e.info.username, e.info.hostname), Style::default().fg(GREY)),
+                Span::styled(
+                    format!("{id}  "),
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}@{}", e.info.username, e.info.hostname),
+                    Style::default().fg(GREY),
+                ),
                 Span::styled(format!("  {age}s"), Style::default().fg(DARK_RED)),
             ]);
             Some(ListItem::new(line))

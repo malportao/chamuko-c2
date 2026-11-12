@@ -1,11 +1,8 @@
-//! Shared C2 state: registered agents, their task queues, and results.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chamuko_protocol::{AgentInfo, Task, TaskResult, Timestamp};
 
-/// A single line in the operator console.
 #[derive(Debug, Clone)]
 pub struct ConsoleLine {
     pub ts: Timestamp,
@@ -91,8 +88,12 @@ impl State {
         self.agents.keys().cloned().collect()
     }
 
-    /// Queue a task for the agent. Returns the task id.
-    pub fn enqueue_task(&mut self, agent_id: &str, command: String, args: Vec<String>) -> Option<String> {
+    pub fn enqueue_task(
+        &mut self,
+        agent_id: &str,
+        command: String,
+        args: Vec<String>,
+    ) -> Option<String> {
         let entry = self.agents.get_mut(agent_id)?;
         self.next_task_id += 1;
         let task_id = format!("task-{:06}", self.next_task_id);
@@ -106,7 +107,6 @@ impl State {
         Some(task_id)
     }
 
-    /// Drain pending tasks for an agent and update its last-seen timestamp.
     pub fn drain_tasks(&mut self, agent_id: &str) -> Option<Vec<Task>> {
         let entry = self.agents.get_mut(agent_id)?;
         entry.last_seen = chamuko_protocol::now_secs();
@@ -114,7 +114,6 @@ impl State {
         Some(tasks)
     }
 
-    /// Store results from an agent and append them to the console.
     pub fn store_results(&mut self, agent_id: &str, results: Vec<TaskResult>) -> Option<()> {
         let entry = self.agents.get_mut(agent_id)?;
         for r in results {

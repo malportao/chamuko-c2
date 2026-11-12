@@ -1,15 +1,5 @@
-//! Chamuko agent builder.
-//!
-//! Compiles `chamuko-agent` with C2 connection parameters baked in at build
-//! time via environment variables, then copies the resulting binary to the
-//! requested output path.
-//!
-//! Usage:
-//!   chamuko-builder --url http://10.0.0.1:8080 [--sleep 10] [--jitter 3] \
-//!     [--name my-agent] [--output ./agent] [--target x86_64-pc-windows-gnu]
-
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 struct Config {
@@ -128,9 +118,6 @@ fn print_help() {
 }
 
 fn build(config: &Config) -> Result<(), String> {
-    // Locate the workspace root. The builder binary lives in target/<profile>/
-    // so the workspace root is two levels up from the binary... but to be
-    // robust, walk up looking for Cargo.toml that contains "[workspace]".
     let workspace_root = find_workspace_root()?;
     eprintln!("[builder] workspace: {}", workspace_root.display());
 
@@ -140,6 +127,16 @@ fn build(config: &Config) -> Result<(), String> {
         "[builder] building agent: url={} sleep={} jitter={} name='{}' profile={}",
         config.url, config.sleep, config.jitter, config.name, profile
     );
+
+    let is_windows_target = config
+        .target
+        .as_deref()
+        .is_some_and(|t| t.contains("windows"));
+    let binary_name = if cfg!(windows) || is_windows_target {
+        "chamuko-agent.exe"
+    } else {
+        "chamuko-agent"
+    };
 
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -158,17 +155,12 @@ fn build(config: &Config) -> Result<(), String> {
         cmd.arg("--target").arg(t);
     }
 
-    let status = cmd.status().map_err(|e| format!("failed to run cargo: {e}"))?;
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to run cargo: {e}"))?;
     if !status.success() {
         return Err("cargo build failed".to_string());
     }
-
-    // Locate the built binary.
-    let binary_name = if cfg!(windows) || config.target.as_deref().is_some_and(|t| t.contains("windows")) {
-        "chamuko-agent.exe"
-    } else {
-        "chamuko-agent"
-    };
 
     let mut bin_path = workspace_root.join("target");
     if let Some(t) = &config.target {
@@ -177,10 +169,12 @@ fn build(config: &Config) -> Result<(), String> {
     bin_path = bin_path.join(profile).join(binary_name);
 
     if !bin_path.exists() {
-        return Err(format!("built binary not found at {}", bin_path.display()));
+        return Err(format!(
+            "built binary not found at {}",
+            bin_path.display()
+        ));
     }
 
-    // Copy to output.
     if let Some(parent) = config.output.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
@@ -190,7 +184,6 @@ fn build(config: &Config) -> Result<(), String> {
     std::fs::copy(&bin_path, &config.output)
         .map_err(|e| format!("failed to copy binary: {e}"))?;
 
-    // Make executable on unix.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -201,13 +194,14 @@ fn build(config: &Config) -> Result<(), String> {
     eprintln!(
         "[builder] done: {} ({} bytes)",
         config.output.display(),
-        std::fs::metadata(&config.output).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&config.output)
+            .map(|m| m.len())
+            .unwrap_or(0)
     );
     Ok(())
 }
 
 fn find_workspace_root() -> Result<PathBuf, String> {
-    // Start from the current working directory and walk up.
     let mut dir = env::current_dir().map_err(|e| format!("cannot get cwd: {e}"))?;
     loop {
         let cargo = dir.join("Cargo.toml");
@@ -219,10 +213,9 @@ fn find_workspace_root() -> Result<PathBuf, String> {
             }
         }
         if !dir.pop() {
-            return Err("could not find workspace root (no Cargo.toml with [workspace])".to_string());
+            return Err(
+                "could not find workspace root (no Cargo.toml with [workspace])".to_string(),
+            );
         }
     }
 }
-
-#[allow(dead_code)]
-fn _unused(_p: &Path) {}

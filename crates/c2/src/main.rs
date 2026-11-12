@@ -1,12 +1,3 @@
-//! Chamuko C2 server entry point.
-//!
-//! Spawns the HTTP listener in a background thread and runs the red/black
-//! Havoc-style TUI on the main thread. Shared state lives behind an
-//! `Arc<Mutex<State>>` so both the HTTP handler and the UI can mutate it.
-//!
-//! With `--headless`, the TUI is skipped and the HTTP server runs directly
-//! on the main thread (useful for testing or headless deployments).
-
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -33,7 +24,6 @@ fn main() -> ExitCode {
     let state = Arc::new(Mutex::new(State::new()));
 
     if args.headless {
-        // Run the HTTP server directly in the main thread.
         if let Err(e) = server::run(state, &args.listen) {
             eprintln!("[c2] server error: {e}");
             return ExitCode::FAILURE;
@@ -41,7 +31,6 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // HTTP server thread.
     let server_state = Arc::clone(&state);
     let server_listen = args.listen.clone();
     let server_handle = std::thread::spawn(move || {
@@ -50,7 +39,6 @@ fn main() -> ExitCode {
         }
     });
 
-    // TUI on the main thread.
     if let Err(e) = tui::run(Arc::clone(&state)) {
         eprintln!("[c2] tui error: {e}");
         drop(server_handle);

