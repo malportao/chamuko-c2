@@ -106,3 +106,12 @@ pub struct ResultsRequest {
     #[serde(default)]
     pub results: Vec<TaskResult>,
 }
+
+pub const SHELLCODE_XOR_KEY: &[u8] = b"chamuko-2024-shellcode-xor-secret-key-v1";
+
+pub fn xor_transform(data: &[u8], key: &[u8]) -> Vec<u8> {
+    data.iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % key.len()])
+        .collect()
+}

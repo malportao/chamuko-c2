@@ -51,9 +51,11 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 name = "chamuko-agent"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chamuko-core",
  "chamuko-plugin-api",
  "chamuko-protocol",
+ "libc",
  "rand",
  "serde",
  "serde_json",
@@ -68,6 +70,7 @@ version = "0.1.0"
 name = "chamuko-c2"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chamuko-protocol",
  "crossterm",
  "ratatui",
