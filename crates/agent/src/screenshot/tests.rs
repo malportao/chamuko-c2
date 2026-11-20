@@ -317,27 +317,25 @@ fn encoder_output_is_accepted_by_a_third_party_png_reader() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-fn fake_backend(tag: &str, script: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("chamuko-fake-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let program = dir.join("backend.sh");
-    std::fs::write(&program, script).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    (dir, program)
+/// Un backend falso sin escribir un ejecutable: `/bin/sh -c <script>`.
+///
+/// Escribir un script y lanzarlo provoca `ETXTBSY` de vez en cuando: otro test
+/// hace `fork()` mientras el fichero esta abierto y el hijo hereda el
+/// descriptor. Pasar el script como argumento evita el problema de raiz.
+fn shell_backend(script: &str) -> (String, Vec<String>) {
+    ("/bin/sh".to_string(), vec!["-c".to_string(), script.to_string()])
 }
 
 #[test]
 fn a_backend_that_writes_garbage_is_rejected() {
-    let (dir, program) = fake_backend("garbage", "#!/bin/sh\necho 'not a png' > \"$1\"\n");
+    let dir = std::env::temp_dir().join(format!("chamuko-shot-garbage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let output = dir.join("shot.png");
+    let (program, args) = shell_backend(&format!("echo 'not a png' > {}", output.display()));
     let plan = CapturePlan {
         backend: Backend::Scrot,
-        program: program.display().to_string(),
-        args: vec![output.display().to_string()],
+        program,
+        args,
         output: output.clone(),
     };
 
@@ -350,12 +348,14 @@ fn a_backend_that_writes_garbage_is_rejected() {
 
 #[test]
 fn a_backend_that_writes_nothing_is_rejected() {
-    let (dir, program) = fake_backend("silent", "#!/bin/sh\nexit 1\n");
+    let dir = std::env::temp_dir().join(format!("chamuko-shot-silent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let output = dir.join("shot.png");
+    let (program, args) = shell_backend("exit 1");
     let plan = CapturePlan {
         backend: Backend::Scrot,
-        program: program.display().to_string(),
-        args: vec![output.display().to_string()],
+        program,
+        args,
         output: output.clone(),
     };
 
@@ -367,16 +367,18 @@ fn a_backend_that_writes_nothing_is_rejected() {
 
 #[test]
 fn a_backend_that_writes_a_real_png_is_accepted() {
-    let (dir, program) = fake_backend("good", "#!/bin/sh\ncp \"$2\" \"$1\"\n");
+    let dir = std::env::temp_dir().join(format!("chamuko-shot-good-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let source = dir.join("source.png");
     let png = encode_png(2, 1, &[1, 2, 3, 4, 5, 6]).unwrap();
     std::fs::write(&source, &png).unwrap();
 
     let output = dir.join("shot.png");
+    let (program, args) = shell_backend(&format!("cp {} {}", source.display(), output.display()));
     let plan = CapturePlan {
         backend: Backend::Scrot,
-        program: program.display().to_string(),
-        args: vec![output.display().to_string(), source.display().to_string()],
+        program,
+        args,
         output: output.clone(),
     };
 

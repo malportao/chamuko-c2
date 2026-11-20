@@ -10,10 +10,12 @@ use chamuko_protocol::{AgentInfo, Task, TaskResult};
 
 mod client;
 mod commands;
+mod messagebox;
 mod screenshot;
 
 use client::{C2Client, C2Error};
 use commands::core_plugin;
+use messagebox::messagebox_plugin;
 use screenshot::ScreenshotPlugin;
 
 struct Config {
@@ -385,6 +387,10 @@ fn main() -> ExitCode {
     let config = Config::from_args();
 
     let mut registry = PluginRegistry::new();
+    if let Err(e) = registry.register(Box::new(messagebox_plugin())) {
+        eprintln!("failed to register messagebox plugin: {e}");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = registry.register(Box::new(ScreenshotPlugin::new())) {
         eprintln!("failed to register screenshot plugin: {e}");
         return ExitCode::FAILURE;
