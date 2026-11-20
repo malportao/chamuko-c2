@@ -53,6 +53,11 @@ impl AgentInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisterRequest {
     pub agent: AgentInfo,
+    /// Desired beacon sleep; the C2 may override it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,10 +88,14 @@ pub struct Task {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct BeaconResponse {
     #[serde(default)]
     pub tasks: Vec<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jitter: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

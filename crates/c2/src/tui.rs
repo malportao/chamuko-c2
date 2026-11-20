@@ -31,6 +31,7 @@ pub struct App {
     history: Vec<String>,
     history_idx: usize,
     console_scroll: usize,
+    status: String,
     quit: bool,
 }
 
@@ -43,6 +44,7 @@ impl App {
             history: Vec::new(),
             history_idx: 0,
             console_scroll: 0,
+            status: String::new(),
             quit: false,
         }
     }
@@ -94,6 +96,7 @@ impl App {
         self.history.push(cmd.clone());
         self.history_idx = self.history.len();
         self.input.clear();
+        self.status.clear();
 
         let parts: Vec<&str> = cmd.splitn(2, char::is_whitespace).collect();
         let head = parts[0];
@@ -166,13 +169,15 @@ impl App {
             self.local_log("no agent selected (use 'list' / 'use <id>')");
             return;
         };
-        let command = head.to_string();
-        let args: Vec<String> = rest
-            .split_whitespace()
-            .map(|s| s.to_string())
-            .collect();
+        let args = match split_args(rest) {
+            Ok(args) => args,
+            Err(e) => {
+                self.local_log(format!("bad arguments: {e}"));
+                return;
+            }
+        };
         let mut s = self.state.lock().unwrap();
-        if s.enqueue_task(&id, command, args).is_none() {
+        if s.enqueue_task(&id, head.to_string(), args).is_none() {
             drop(s);
             self.local_log("failed to enqueue task");
         }
@@ -224,12 +229,15 @@ impl App {
     }
 
     fn local_log(&mut self, text: impl Into<String>) {
+        let text = text.into();
         if let Some(id) = self.selected_agent() {
             let mut s = self.state.lock().unwrap();
             if let Some(entry) = s.get_mut(&id) {
                 entry.push_console(text);
+                return;
             }
         }
+        self.status = text;
     }
 
     fn refresh_list_log(&mut self) {
@@ -365,6 +373,11 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_agents(f, app, body[0]);
     render_console(f, app, body[1]);
 
+    let input_title = if app.status.is_empty() {
+        " command ".to_string()
+    } else {
+        format!(" {} ", app.status.lines().next().unwrap_or(""))
+    };
     let input = Paragraph::new(app.input.as_str())
         .style(Style::default().fg(BRIGHT).bg(BLACK))
         .block(
@@ -373,7 +386,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .border_style(Style::default().fg(DARK_RED))
                 .style(Style::default().bg(BLACK))
                 .title(Span::styled(
-                    " command ",
+                    input_title,
                     Style::default().fg(RED).add_modifier(Modifier::BOLD),
                 )),
         );
@@ -457,17 +470,20 @@ fn render_console(f: &mut Frame, app: &mut App, area: Rect) {
                 Some(e) => e
                     .console
                     .iter()
-                    .skip(app.console_scroll)
-                    .map(|l| Line::from(l.text.clone()))
+                    .map(|l| Line::from(format!("{} {}", clock(l.ts), l.text)))
                     .collect(),
                 None => vec![Line::from("agent not found")],
             }
         }
         None => vec![Line::from(Span::styled(
-            "no agent selected — use 'list' and 'use <id>'",
+            "no agent selected, use 'list' and 'use <id>'",
             Style::default().fg(GREY),
         ))],
     };
+
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let visible = area.height.saturating_sub(2) as usize;
+    let total = wrapped_rows(&lines, width);
 
     let para = Paragraph::new(lines)
         .block(
@@ -483,5 +499,93 @@ fn render_console(f: &mut Frame, app: &mut App, area: Rect) {
         .style(Style::default().fg(Color::Rgb(230, 230, 230)).bg(BLACK))
         .wrap(Wrap { trim: false });
 
-    f.render_widget(para, area);
+    let max_offset = total.saturating_sub(visible);
+    app.console_scroll = app.console_scroll.min(max_offset);
+    let offset = max_offset - app.console_scroll;
+
+    f.render_widget(para.scroll((offset as u16, 0)), area);
+}
+
+/// Approximates how many terminal rows `lines` occupy once wrapped at `width`.
+fn wrapped_rows(lines: &[Line], width: usize) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            let chars: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            chars.div_ceil(width).max(1)
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+/// Formats a Unix timestamp as `HH:MM:SS` in UTC.
+fn clock(ts: chamuko_protocol::Timestamp) -> String {
+    let secs = ts % 86_400;
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Splits a command line into arguments, respecting single and double quotes.
+fn split_args(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+
+    for ch in input.chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '"' || ch == '\'' => {
+                quote = Some(ch);
+                started = true;
+            }
+            None if ch.is_whitespace() => {
+                if started {
+                    args.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            None => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+
+    if quote.is_some() {
+        return Err("unterminated quote".to_string());
+    }
+    if started {
+        args.push(current);
+    }
+    Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_args;
+
+    #[test]
+    fn splits_plain_words() {
+        assert_eq!(split_args("a b  c").unwrap(), vec!["a", "b", "c"]);
+        assert!(split_args("   ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn keeps_quoted_segments_together() {
+        assert_eq!(
+            split_args(r#""C:\Program Files\app.exe" --flag 'x y'"#).unwrap(),
+            vec![r"C:\Program Files\app.exe", "--flag", "x y"]
+        );
+    }
+
+    #[test]
+    fn preserves_empty_quoted_argument() {
+        assert_eq!(split_args("exec ''").unwrap(), vec!["exec", ""]);
+    }
+
+    #[test]
+    fn rejects_unterminated_quotes() {
+        assert!(split_args("exec \"oops").is_err());
+    }
 }

