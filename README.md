@@ -11,8 +11,11 @@ Framework de red teaming multi-plataforma en Rust. Tiene tres piezas: el agente 
 - **Token compartido:** C2 y agentes se autentican con el mismo Bearer (`--token` o `CHAMUKO_TOKEN`).
 - **Sleep y jitter en caliente:** los cambias desde la TUI y el agente los aplica en el siguiente beacon, sin reiniciarlo.
 - **Se recupera solo:** si reinicias el C2, el agente ve el `404`, se vuelve a registrar y sigue.
-- **Plugins:** cada comando es un plugin estático. El `PluginRegistry` manda la tarea al primero que la soporte.
-- **Comandos incluidos:** `exec`, `info`, `whoami`, `hostname`, `pwd`, `ls`, `cd`, `ps`, `shellcode`, `download`, `upload`, `help`.
+- **Plugins declarativos:** un comando es una línea. `PluginBuilder` + una closure y ya está: sin struct, sin implementar cinco métodos. La aridad se valida antes de ejecutar el handler, así que el handler nunca comprueba argumentos.
+- **Enrutado por tabla:** el registro guarda `comando -> plugin` en un mapa. Un comando duplicado se rechaza al registrar en vez de depender del orden, y el despacho es una búsqueda, no un recorrido.
+- **Política y auditoría:** allowlist o denylist de comandos, y un registro de auditoría acotado. La auditoría guarda el nombre y el número de argumentos, **nunca los valores**: por ahí pasan tokens y contraseñas.
+- **Comandos incluidos:** `exec`, `info`, `whoami`, `hostname`, `pwd`, `ls`, `cd`, `ps`, `shellcode`, `download`, `upload`, `screenshot`, `help`.
+- **Screenshot:** captura la pantalla y la manda como PNG por el mismo camino troceado que `download`. Elige backend solo: PowerShell en Windows, `screencapture` en macOS, y en Linux `grim` → `scrot` → `import` → framebuffer de `/dev/fb0`. Si el backend deja un fichero que no es un PNG, se descarta en vez de mandar basura.
 - **Transferencia de ficheros troceada:** descargas de hasta 64 MiB en chunks de 64 KiB, con reensamblado en `./loot` y verificación SHA-256 en cada punta. El agente no manda un fichero de golpe: lo parte y el C2 comprueba que llegaron todos los trozos antes de escribirlo.
 - **Implant de binarios:** subes un fichero al agente por chunks y él lo escribe en la ruta que le digas, comprobando el hash.
 - **Ciclo de vida de tareas:** cada tarea pasa por `queued → sent → completed/failed`, con hora de envío, hora de fin y duración en milisegundos. No se reenvía lo ya entregado.
@@ -219,13 +222,29 @@ Lo que cambia según el sistema y ya está resuelto:
 - **Rutas:** `cd` entiende letras de unidad (`C:\`) en Windows y rutas absolutas en Unix.
 - **Extensiones:** el builder pone `.exe` solo cuando el target es Windows.
 
+## Escribir un plugin
+
+Un comando nuevo son cuatro líneas:
+
+```rust
+PluginBuilder::new("net", "0.1.0")
+    .command("ping", "ping a host", Arity::Exactly(1), |ctx| {
+        Ok(CommandOutput::new(format!("would ping {}", ctx.args[0])))
+    })
+    .build()
+```
+
+El handler recibe un `CommandContext` con los argumentos, el directorio de trabajo y la plataforma. Si necesita devolver un fichero, lo mete en `CommandOutput::with_attachment(...)` y el bucle de beacon lo sube solo.
+
 ## Tests
 
 ```bash
 cargo test --workspace
 ```
 
-Cubren el reensamblado de chunks (incluido el fichero vacío y los trozos desordenados), el saneado de nombres, el ciclo de vida de las tareas, el rechazo de versiones de protocolo distintas, y los comandos `ps`, `download` y `upload` contra ficheros reales en disco.
+137 tests. Cubren el reensamblado de chunks (fichero vacío y trozos desordenados), el saneado de nombres, el ciclo de vida de las tareas, el rechazo de versiones de protocolo distintas, los comandos contra ficheros reales, la aridad y el enrutado del registro, la política allowlist/denylist, que la auditoría no filtre argumentos, el timeout que mata un proceso colgado, el recorte de salida en límites UTF-8, y la selección de backend de screenshot en las cuatro plataformas.
+
+Los PNG que genera el encoder del framebuffer se validan con Python (`zlib` + `struct`, comprobando el CRC de cada chunk): verificar la salida con nuestro propio parser no demostraría nada.
 
 ## Licencia
 

