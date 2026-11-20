@@ -19,6 +19,7 @@ publish = false
 chamuko-plugin-api = { path = "crates/plugin-api" }
 chamuko-core = { path = "crates/core" }
 chamuko-protocol = { path = "crates/protocol" }
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
